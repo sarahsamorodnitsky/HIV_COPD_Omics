@@ -1,0 +1,3262 @@
+---
+title: "HIV-COPD: SomaScan Complete Analysis"
+author: "Sarah Samorodnitsky"
+date: "7/20/2021"
+output: 
+  html_document:
+    code_folding: hide
+header-includes:
+  - \usepackage{placeins}
+---
+
+```{r setup, include = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r, eval = FALSE, message = FALSE}
+# Package installation ---
+devtools::install_github("SomaLogic/SomaDataIO")
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+   install.packages("BiocManager")
+}
+
+BiocManager::install("Biobase")
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Cleaning the Data {.panel-title}
+## {.panel-body}
+
+```{r, message = FALSE, echo = FALSE, message = FALSE}
+# packages
+library(SomaDataIO)
+library(tidyverse)
+library(magrittr)
+library(readxl)
+library(kableExtra)
+library(qvalue)
+
+# working directories
+somascan_wd <- "/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/"
+lavage_wd <- "/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/Lavage_Biocrates/"
+```
+
+We will import and format the SomaScan data for the HIV-COPD project. I've moved everything out of the UMN folder that the data was originally sent in and put it into the SomaScan directory on Dropbox. 
+
+When we opened the data and ran `getFeatureData`, we obtain information on the reagents and target proteins they map to. 
+
+All observations pass quality control and there are 7596 total proteins in the dataset. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# loading in the data using the SomaDataIO package
+somascan_normalized <- read_adat(paste0(somascan_wd,
+                                 "SS-216716_v4.1_BALF.hybNorm.medNormInt.plateScale.medNormSMP.adat"))
+
+# loading in the annotated dataset
+somascan_annotations <- read_xlsx(paste0(somascan_wd, "SomaScan_V4.1_7K_Annotated_Content_2020_External_12.14.20.xlsx"))
+colnames(somascan_annotations) <- somascan_annotations[3,]
+somascan_annotations <- somascan_annotations[-c(1:3),]
+
+# how many features?
+# length(somascan_normalized %>% getFeatures)
+
+# any not pass QC?
+# any(somascan_normalized$RowCheck != "PASS")
+```
+
+We will remove any non-human targets in the SomaScan data. There were 7335 human target proteins, some of which correspond to "no protein" targets. After excluding those (of which there were 34), 7301 human proteins remain for further analysis. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# saving the column data
+somascan_col_meta <- somascan_normalized %>% getAnalyteInfo
+
+# determining the types of organism protein targets
+somascan_col_meta %>% dplyr::select(Organism) %>% table
+
+# saving the indices of the human protein targets
+human_targets <- somascan_col_meta$Organism == "Human"
+human_proteins <- (somascan_normalized %>% getFeatures)[human_targets]
+
+# saving the indices of the "no protein" targets
+no_protein_targets <- somascan_col_meta$Target == "No Protein"
+no_proteins <- (somascan_normalized %>% getFeatures)[no_protein_targets]
+
+# removing the human proteins with no protein targets
+## this is where we exclude any human proteins that have no protein targets, so in the end
+## we exclude non-human proteins and any human proteins that don't map to anything
+human_proteins_without_no_protein <- human_proteins[!(human_proteins %in% no_proteins)] 
+
+# check
+length(human_targets) == length(somascan_normalized %>% dplyr::select(contains("seq")))
+length(human_proteins) == sum(human_targets)
+
+# selecting just the human target proteins
+somascan_normalized_human <- somascan_normalized %>% 
+  dplyr::select(all_of(getMeta(somascan_normalized)), all_of(human_proteins_without_no_protein))
+
+# check
+ncol(somascan_normalized_human) == length(human_targets) - sum(!human_targets) - sum(no_protein_targets) +
+  length(getMeta(somascan_normalized))
+
+# this is the dataset to use going forward: somascan_normalized_human
+is.soma_adat(somascan_normalized_human)
+
+# How many unique protein targets did these aptamers map to?
+human_proteins_without_no_protein_rename <- 
+  sapply(human_proteins_without_no_protein %>% strsplit("[.]"), function(protein) paste0(protein[2], "-", protein[3]))
+
+somascan_annotations %>% filter(SeqID %in% human_proteins_without_no_protein_rename) %>% 
+  dplyr::select(`UniProt ID`) %>% unique %>% unlist %>% length
+```
+
+We start by making histograms of the protein data and checking for skewness. Both data are columnwise centered and scaled. A log transformation appears to make the data look slightly more normal, so we will proceed with logged data for our analysis. Before making the histogram, we select only the true, non-buffer, rows in the dataset. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# histograms of the protein data for the actual samples and human proteins
+features <- somascan_normalized_human %>% getFeatures 
+somascan_normalized_human_samples_feature_data <- somascan_normalized_human %>% 
+  filter(SampleType == "Sample") %>% 
+  dplyr::select(all_of(features)) 
+
+# scaling and center
+somascan_normalized_human_samples_feature_data_scale <- 
+  scale(somascan_normalized_human_samples_feature_data)
+
+# scaling and centering the log-transformed data
+somascan_normalized_human_samples_feature_data_log_scale <- 
+  scale(log(somascan_normalized_human_samples_feature_data + 1))
+  
+par(mfrow = c(1,2))
+hist(somascan_normalized_human_samples_feature_data_scale %>% unlist, breaks = 50,
+     xlab = "Aptamer Abundances", main = "Normalized, Untransformed \n Aptamer Abundances")
+
+hist(somascan_normalized_human_samples_feature_data_log_scale, breaks = 50,
+     xlab = "Aptamer Abundances", main = "Normalized, Log-Transformed \n Aptamer Abundances")
+par(mfrow = c(1,1))
+```
+
+Since the samples were run in batches, we'd like to check for a batch effect or any noticeable differences between the batches. We will do this with a PCA plot of the samples, colored by their batch. There doesn't appear to be a batch effect based on the PCA plot because we don't see any batches cluster off on their own. We only checked the first 3 PCs and feel that is sufficient in checking for batch effect. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# SVD
+somascan_normalized_human_samples_feature_data_log_center <-
+  scale(log(somascan_normalized_human_samples_feature_data), center = TRUE, scale = FALSE)
+somascan_svd <- svd(somascan_normalized_human_samples_feature_data_log_center)
+UD <- somascan_svd$u %*% diag(somascan_svd$d)
+
+# PCA plot
+colors <- somascan_normalized_human %>% filter(SampleType == "Sample") %>% select(Subarray) %>% unlist
+
+## PC 1 vs. 2
+plot(UD[,1], UD[,2], xlab = "pc 1", ylab = "pc 2",
+     main = "PCA Plot of SomaScan Data", 
+     col = colors, pch = 16)
+legend("bottomright", legend = 1:8, col = colors %>% unique, pch = 16, title = "Subarray", cex = 0.8)
+
+## PC 1 vs. 3
+plot(UD[,1], UD[,3], xlab = "pc 1", ylab = "pc 3",
+     main = "PCA Plot of SomaScan Data", 
+     col = colors, pch = 16)
+legend("bottomright", legend = 1:8, col = colors %>% unique, pch = 16, title = "Subarray", cex = 0.8)
+
+## PC 2 vs. 3
+plot(UD[,2], UD[,3], xlab = "pc 1", ylab = "pc 3",
+     main = "PCA Plot of SomaScan Data", 
+     col = colors, pch = 16)
+legend("bottomright", legend = 1:8, col = colors %>% unique, pch = 16, title = "Subarray", cex = 0.8)
+```
+
+We also check the loadings from the first PC from PCA to determine if there is a large mean effect. We will do this on the uncentered, original data. The loadings appear to be very large, indicating a large mean effect. Compare this to the second histogram of the loadings from the first PC, which can be seen to be centered at 0. 
+
+Note that I am using the standardized version of the loadings, as found [here](https://stats.stackexchange.com/questions/134282/relationship-between-svd-and-pca-how-to-use-svd-to-perform-pca).
+```{r, echo = FALSE, message = FALSE, include = FALSE, eval = FALSE}
+# first computing the logged data, uncentered
+somascan_normalized_human_samples_feature_data_log <- log(somascan_normalized_human_samples_feature_data)
+
+# performing the SVD
+somascan_svd_uncenter <- svd(somascan_normalized_human_samples_feature_data_log)
+
+# computing the scores and saving the loadings for the uncentered data
+UD_uncenter <- somascan_svd_uncenter$u %*% diag(somascan_svd_uncenter$d)
+V_uncenter <- somascan_svd_uncenter$v
+S_uncenter <- diag(somascan_svd_uncenter$d)
+
+# for the centered data
+V_center <- somascan_svd$v
+S_center <- diag(somascan_svd$d)
+
+# saving the sample size
+n <- nrow(somascan_normalized_human_samples_feature_data)
+
+# plotting the loadings from the first PC
+par(mfrow = c(1,2))
+hist((V_uncenter %*% S_uncenter)[,1]/(sqrt(n-1)), main = "Loadings from PC1 \n Uncentered Data", xlab = "Loadings")
+hist((V_center %*% S_center)[,1]/(sqrt(n-1)), main = "Loadings from PC1 \n Centered Data", xlab = "Loadings")
+par(mfrow = c(1,1))
+```
+
+We also check how many protein targets are unique according to their `TargetName`. To do this, we will remove the non-human samples because they are clearly duplicated. There are 822 duplicated protein targets. There are 6479 unique target proteins out of 7335 human-target proteins in the dataset. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+target_protein_names <- somascan_normalized %>% 
+                          getAnalyteInfo %>% 
+                          filter(Organism == "Human" & TargetFullName != "No protein") %>% # only human proteins
+                          dplyr::select(TargetFullName)
+
+target_protein_info <- somascan_normalized %>% 
+                       getAnalyteInfo %>% 
+                       filter(Organism == "Human" & TargetFullName != "No protein")
+
+any(duplicated(target_protein_names))
+sum(duplicated(target_protein_names))
+
+nrow(unique(target_protein_names))
+```
+****
+We will consider determining whether some proteins should be filtered out because they don't meet the LOD. In the annotated protein sheet, there is a column `LODB` which we will use to see how many observations are above the LOD. If there are any proteins for which more than half of subjects had observations below the LODB, we will remove those from future analysis. We also compare this method of filtering proteins with the method proposed by [this article](https://link.springer.com/protocol/10.1007/978-1-4939-9706-0_13#Sec12) which suggests using the buffer rows in the Somascan dataset to calculate LODs. 
+
+Using the first method (the LoDB column), we found that 1279 proteins had over 50% of the observations below the LOD. This includes 2 subjects who ultimately will not be in the analysis. Using the second approach from the reference, 3048 proteins were below the calculated LOD. 
+
+We ultimately chose to use the empirical LOD calculation to filter out proteins. Of those proteins remaining, 2035 proteins have 0 to 5% of the observations below the calculated LOD. 446 proteins are have 5% to 10% of their observations below the LOD and 540 have between 10% and 20% of their observations below the LOD. 
+```{r, echo = FALSE, message = FALSE, warning = FALSE, eval = FALSE} 
+# -----------------------------------------------------------------------------
+# First, using the LODB column in the Somascan annotated dataset
+# -----------------------------------------------------------------------------
+
+# obtaining the LODs from the annotated dataset
+seqIDs_for_annotations <- somascan_col_meta %>% 
+  filter(AptName %in% human_proteins_without_no_protein) %>% 
+  dplyr::select(SeqId) %>% unlist # this is in the same order as the human_proteins_without_no_protein vector
+annotations_for_human_proteins <- somascan_annotations %>% filter(SeqID %in% seqIDs_for_annotations) 
+lodb_for_human_proteins <- annotations_for_human_proteins %>% dplyr::select(SeqID, LoDB)
+
+# reordering the LODs to match the order in the protein level data
+lodb_for_human_proteins_reorder <- lodb_for_human_proteins[match(seqIDs_for_annotations, lodb_for_human_proteins$SeqID),]
+all(lodb_for_human_proteins_reorder$SeqID == seqIDs_for_annotations)
+
+# subsetting just the protein columns
+somascan_normalized_human_features <- somascan_normalized_human %>%
+  filter(SampleType == "Sample") %>% 
+  dplyr::select(all_of(human_proteins_without_no_protein)) 
+
+# Going down the columns and comparing to the LOD
+above_lod <- sapply(1:ncol(somascan_normalized_human_features), function(col) {
+  current_col <- somascan_normalized_human_features[,col]
+  current_col >= as.numeric(lodb_for_human_proteins_reorder[col, "LoDB"])
+})
+
+# Did any not meet the LOD threshold?
+any(above_lod == FALSE)
+sum(above_lod == FALSE)
+
+# Which cols were > 50% below LOD?
+perc_below_lod <- sapply(1:ncol(somascan_normalized_human_features), function(col) {
+    current_col <- above_lod[,col]
+    perc_below_lod <- sum(!current_col)/length(current_col)
+})
+names(perc_below_lod) <- colnames(somascan_normalized_human_features)
+over_50_perc_below_lod <- perc_below_lod[perc_below_lod >= 0.5]
+
+# -----------------------------------------------------------------------------
+# Second, using the calculation from the 'rat' paper to compute the LOD 
+# using the buffer "no protein" rows
+# -----------------------------------------------------------------------------
+buffer_rows <- somascan_normalized_human %>% # using this one because we haven't removed non-sample rows
+  filter(SampleType == "Buffer") %>% 
+  dplyr::select(all_of(human_proteins_without_no_protein))
+
+# calculating the lod for each column using the formula from the reference
+lod_based_on_ref <- sapply(1:ncol(buffer_rows), function(col) {
+  current_col <- buffer_rows[,col]
+  current_median <- median(current_col)
+  mad <- median(abs(current_col - current_median))
+  current_median + 4.5*mad
+})
+names(lod_based_on_ref) <- human_proteins_without_no_protein
+
+# Going down the columns and comparing to the LOD
+above_lod_v2 <- sapply(1:ncol(somascan_normalized_human_features), function(col) {
+  current_col <- somascan_normalized_human_features[,col]
+  current_col >= as.numeric(lod_based_on_ref[col]) # TRUE means ABOVE LOD
+})
+
+# Did any not meet the LOD threshold?
+any(above_lod_v2 == FALSE)
+sum(above_lod_v2 == FALSE)
+
+# Which cols were > 50% below LOD?
+perc_below_lod_v2 <- sapply(1:ncol(somascan_normalized_human_features), function(col) {
+    current_col <- above_lod_v2[,col]
+    perc_below_lod <- sum(!current_col)/length(current_col) # How many FALSES (not above LOD) were there
+})
+names(perc_below_lod_v2) <- colnames(somascan_normalized_human_features)
+over_50_perc_below_lod_v2 <- perc_below_lod_v2[perc_below_lod_v2 >= 0.5]
+
+# -----------------------------------------------------------------------------
+# Distribution of the percentage below LOD for the remaining proteins
+# -----------------------------------------------------------------------------
+
+hist(perc_below_lod_v2, xlab = "Percent Below LOD", 
+     main = "Distribution of %s Below LODs \n for ALL Proteins",
+     breaks = 20)
+
+# hist(perc_below_lod_v2[perc_below_lod_v2 < 0.5], xlab = "Percent Below LOD", 
+#      main = "Distribution of %s Below LODs \n for Proteins After Filtering")
+
+perc_below_lod_v2_tab <- data.frame(perc_below_lod_range = character(11),
+                                    number_proteins = numeric(11))
+perc_below_lod_v2_tab$perc_below_lod_range <- c("0-5%", "5%-10%", "10%-20%",
+                                                "20%-30%", "30%-40%", "40%-50%",
+                                                "50%-60%",
+                                                "60%-70%", "70%-80%", 
+                                                "80%-90%", ">90%")
+
+# Filling in the table with the counts of proteins
+perc_below_lod_v2_tab$number_proteins[1] <- length(perc_below_lod_v2[perc_below_lod_v2 < 0.05])
+
+perc_below_lod_v2_tab$number_proteins[2] <- length(perc_below_lod_v2[0.05 <= perc_below_lod_v2 &
+                                                                     perc_below_lod_v2 < 0.1])
+
+perc_below_lod_v2_tab$number_proteins[3] <- length(perc_below_lod_v2[0.1 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.2])
+
+perc_below_lod_v2_tab$number_proteins[4] <- length(perc_below_lod_v2[0.2 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.3])
+
+perc_below_lod_v2_tab$number_proteins[5] <- length(perc_below_lod_v2[0.3 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.4])
+
+perc_below_lod_v2_tab$number_proteins[6] <- length(perc_below_lod_v2[0.4 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.5])
+
+perc_below_lod_v2_tab$number_proteins[7] <- length(perc_below_lod_v2[0.5 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.6])
+
+perc_below_lod_v2_tab$number_proteins[8] <- length(perc_below_lod_v2[0.6 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.7])
+
+perc_below_lod_v2_tab$number_proteins[9] <- length(perc_below_lod_v2[0.7 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.8])
+
+perc_below_lod_v2_tab$number_proteins[10] <- length(perc_below_lod_v2[0.8 <= perc_below_lod_v2 & 
+                                                                       perc_below_lod_v2 < 0.9])
+
+perc_below_lod_v2_tab$number_proteins[11] <- length(perc_below_lod_v2[0.9 <= perc_below_lod_v2])
+
+kable(perc_below_lod_v2_tab, format = "html", align = "c",
+      col.names = c("Percentage", "Number of Proteins"),
+      caption = "Number of aptamers who have corresponding percentage of observations below LOD.") %>% 
+  kable_styling(full_width = F)
+```
+
+Now that we have computed how many proteins are below the LOD using either method, we ultimately chose to use the empirical LOD proposed by the rat reference paper. After removing proteins that have over 50% of their observations below the LOD, we are left with 4253 proteins. We removed 3048 proteins from the data. Previous to this, we had 7301 proteins in the dataset. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# Removing proteins that were below the empirical LOD
+somascan_normalized_human_samples_feature_data %<>%
+  dplyr::select(-all_of(names(over_50_perc_below_lod_v2)))
+length(somascan_normalized_human_samples_feature_data %>% getAnalytes)
+
+# Removing these proteins from the protein info, too
+target_protein_info %<>% filter(!(AptName %in% names(over_50_perc_below_lod_v2)))
+```
+
+Also adding a column that matches the tube number to the patient ID from the clinical data. This way we can match this data to the other clinical information we have. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# saving the metadeta
+somascan_normalized_samples <- somascan_normalized %>% 
+  filter(SampleType == "Sample")
+
+metadata <- somascan_normalized_samples[, getMeta(somascan_normalized_samples)]
+
+# the new dataset (not logged or centered/scale)
+somascan_normalized_human_samples_feature_data_meta_data <-
+  cbind.data.frame(metadata,
+                   somascan_normalized_human_samples_feature_data)
+
+# loading in the tube-to-PID matching data
+sample_list <- read_excel(paste0(somascan_wd, "Sample list.xlsx"))
+SampleIds <- somascan_normalized_human_samples_feature_data_meta_data$SampleId
+sample_list_matched <- sample_list[match(SampleIds, sample_list$`Tube Number`),]
+
+# all(sample_list_matched$`Tube Number` == SampleIds)
+
+# adding a new column with the patient ID
+somascan_normalized_human_samples_feature_data_meta_data_pid <- 
+  cbind.data.frame(PID = sample_list_matched$PID,
+                   somascan_normalized_human_samples_feature_data_meta_data)
+```
+
+Now that we have the patient IDs in the proteomics dataset, we will match this data to the clinical data. There were 2 patient IDs not available in the proteomics dataset so we removed those subjects. These subjects were V_8 and P_52260024 and they belonged to the same case-control pair. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# loading in the clinical data
+clinical_data <- read_excel(paste0(lavage_wd, "Pitt-Vancouver FINAL MATCH CORRECTED 7-9-20.xlsx"),
+                            n_max = 55)
+
+# saving the order of the sample IDs in the proteomics dataset, matching it to the clinical dataset
+clinical_data_ids <- clinical_data$id
+
+# sample IDs in the proteomics data
+SampleIds_V2 <- somascan_normalized_human_samples_feature_data_meta_data_pid$PID
+
+# checking the lengths and see if any IDs are missing
+# length(clinical_data_ids)
+# length(SampleIds_V2)
+missing_IDs <- clinical_data_ids[!(clinical_data_ids %in% SampleIds_V2)]
+clinical_data %>% filter(id %in% missing_IDs) %>% dplyr::select(setnumber...2) # in the same pair
+
+# removing the missing subjects from the clinical data and the proteomics data
+clinical_data_avail <- clinical_data %>% filter(!(id %in% missing_IDs))
+somascan_normalized_human_samples_feature_data_meta_data_pid_avail <-
+  somascan_normalized_human_samples_feature_data_meta_data_pid %>% filter(!(PID %in% missing_IDs))
+
+# check
+nrow(somascan_normalized_human_samples_feature_data_meta_data_pid_avail) == nrow(clinical_data_avail)
+
+# resaving the IDs
+clinical_data_ids_avail <- clinical_data_avail$id
+SampleIds_V2_avail <- somascan_normalized_human_samples_feature_data_meta_data_pid_avail$PID
+
+# reordering the proteomics PIDs to match the clinical data IDs
+somascan_normalized_human_samples_feature_data_meta_data_pid_avail_reorder <- 
+  somascan_normalized_human_samples_feature_data_meta_data_pid_avail[match(clinical_data_ids_avail,
+                                                                     SampleIds_V2_avail),]
+
+# checking the order matches
+all(somascan_normalized_human_samples_feature_data_meta_data_pid_avail_reorder$PID == 
+    clinical_data_ids_avail)
+```
+
+And finally, we save the dataset for future analysis. This dataset contains 3872 unique UniProt IDs. 
+
+```{r, echo = FALSE, message = FALSE, eval = FALSE}
+# changing the pair column in the clinical data
+colnames(clinical_data_avail)[colnames(clinical_data_avail) == "setnumber...2"] <- "Pair"
+
+# save
+somascan_normalized_clean <- somascan_normalized_human_samples_feature_data_meta_data_pid_avail_reorder
+clinical_data_soma <- clinical_data_avail
+
+save(somascan_normalized_clean, target_protein_info, clinical_data_soma,
+     file = paste0(somascan_wd, "HIV_COPD_SomaScan_Normalized_Clean.rda"))
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Univariate Analyses {.panel-title}
+## {.panel-body}
+
+In this section, we perform univariate testing. We consider the protein-by-protein differences between cases and controls. 
+```{r, message = FALSE, warning = FALSE}
+# Working directories
+somascan_wd <- "/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/"
+
+# Loading in the data
+load(paste0(somascan_wd, "HIV_COPD_SomaScan_Normalized_Clean.rda"))
+
+# Loading in the annotated dataset
+somascan_annotations <- read_xlsx(paste0(somascan_wd, "SomaScan_V4.1_7K_Annotated_Content_2020_External_12.14.20.xlsx"))
+colnames(somascan_annotations) <- somascan_annotations[3,]
+somascan_annotations <- somascan_annotations[-c(1:3),]
+
+# Saving the proteins
+aptamers <- somascan_normalized_clean %>% getFeatures 
+n_proteins <- length(aptamers)
+
+# Mapping the seqIDs back to the target names
+seqids_to_match <- substr(aptamers, start = 5, stop = 20) %>% str_replace(pattern = "[.]", replacement = "-")
+protein.names.tab <- somascan_annotations %>% # obtain the target names
+  filter(SeqID %in% seqids_to_match) %>% 
+  dplyr::select(SeqID, `Target Name`, `UniProt ID`)
+
+# Reordering the protein names so they match the SeqIDs in the SomaScan data
+protein.names.tab.reorder <- protein.names.tab[match(seqids_to_match, protein.names.tab$SeqID), ]
+protein.names.tab.reorder$SeqID <- aptamers
+
+# Saving the protein target names
+protein_target_names <- protein.names.tab.reorder$`Target Name`
+
+# Saving the UniProt IDs
+UniProtIDs <- protein.names.tab.reorder$`UniProt ID`
+
+# At this point, the protein names are in the same order as the sequence IDs
+# If you need to double-check, use `protein.names.tab.reorder` for checking the order of 
+# proteins names and SeqIDs. Added the original format of the sequence IDs
+
+# Check
+all(protein.names.tab.reorder$SeqID == aptamers) # TRUE!
+
+# logging and scaling the data
+somascan_normalized_clean_features <- somascan_normalized_clean[, aptamers] # just proteins
+somascan_normalized_clean_features_log_scale <- scale(log(somascan_normalized_clean_features + 1))
+
+# Adding the patient IDs as row names
+rownames(somascan_normalized_clean_features) <- somascan_normalized_clean$PID
+rownames(somascan_normalized_clean_features_log_scale) <- somascan_normalized_clean$PID
+
+# Saving the outcome
+fev1pp <- clinical_data_soma$FEV1_percent_predicted
+names(fev1pp) <- clinical_data_soma$id
+```
+
+### Demographics Table
+
+```{r Creating Table 1 for the Entire Dataset, message = FALSE, warning = FALSE}
+# Add a column to the clinical data that identifies whether a subject stands out or not
+clinical_data_soma_tab1 <- clinical_data_soma
+
+# Ethnicity/race
+clinical_data_soma_tab1$ethnicity <- as.factor(clinical_data_soma_tab1$ethnicity)
+levels(clinical_data_soma_tab1$ethnicity) <- c("Black, Non-Hispanic",
+                                             "White, Hispanic/Latino",
+                                             "Asian/Pacific Islander")
+
+# Sex
+clinical_data_soma_tab1$sex <- as.factor(clinical_data_soma_tab1$sex)
+levels(clinical_data_soma_tab1$sex) <- c("Male", "Female")
+
+# Smoker
+clinical_data_soma_tab1$smoker <- as.factor(clinical_data_soma_tab1$smoker)
+levels(clinical_data_soma_tab1$smoker) <- c("Yes", "No")
+
+# ART
+clinical_data_soma_tab1$art <- as.factor(clinical_data_soma_tab1$art)
+levels(clinical_data_soma_tab1$art) <- c("Yes", "No")
+
+# Case:Control (cases = 1, controls = 2)
+clinical_data_soma_tab1$ccstat <- as.factor(clinical_data_soma_tab1$ccstat)
+levels(clinical_data_soma_tab1$ccstat) <- c("Case", "Control")
+
+# Table 1 for all patients
+library(table1)
+table1(~ sex + age + ethnicity + smoker + art + FEV1_percent_predicted + fev1fvc| ccstat, 
+       data = clinical_data_soma_tab1,
+       overall = "Total", caption = "Demographics by case-control status for entire dataset.")
+
+
+```
+
+
+### Correlations Between Proteins
+
+We start by looking at the distribution of correlations between 2 randomly-selected proteins. 
+
+1. We first randomly select 1000 pairs of proteins, compute their Pearson correlation, and plot the correlations. 
+
+The correlations between 1000 randomly selected pairs of proteins show that most are uncorrelated, as indicated by the distribution being centered at 0. However, there are some proteins that are nearly perfectly correlated, as indicated by a tail at 1. This may be due to the duplicated protein targets in the data. 
+
+```{r, message = FALSE}
+# -----------------------------------------------------------------------------
+# Randomly selecting 1000 pairs of proteins and calculating their correlation
+# -----------------------------------------------------------------------------
+
+corrs <- c()
+set.seed(1)
+for (i in 1:1000) {
+  inds <- sample(1:n_proteins, size = 2, replace = FALSE) # sample inds
+  selected <- aptamers[inds] # find corresponding proteins
+  selected_data <- somascan_normalized_clean_features_log_scale[, selected]
+  corrs[i] <- cor(selected_data[,1], selected_data[,2])
+}
+
+# Plotting
+hist(corrs, main = "Correlations of 1000 \n Randomly-Selected Protein Pairs", xlab = "Correlations")
+```
+
+2. Then we plot the correlations between reagents that share the same name. 
+
+There are 62 proteins that are present more than twice in the dataset, meaning there are 62 proteins that have more than 2 reagents that map to them. 
+
+```{r, message = FALSE}
+# finding the list of duplicated protein targets
+duplicated_inds <- duplicated(target_protein_info$TargetFullName) | 
+  duplicated(target_protein_info$TargetFullName, fromLast = TRUE) 
+target_protein_duplicated <- target_protein_info[duplicated_inds, ]
+
+# are there any proteins matched to more than 2 reagents?
+any(table(target_protein_duplicated$Target) > 2)
+table(target_protein_duplicated$Target)[table(target_protein_duplicated$Target) > 2]
+
+# iterating through the duplicated proteins
+duplicated_proteins <- unique(target_protein_duplicated$TargetFullName)
+n_duplicated_proteins <- length(duplicated_proteins)
+
+# corrs_duplicated <- c() # storing correlations
+# protein1 <- c() # storing first protein
+# protein2 <- c() # storing second protein
+# 
+# for (iter in 1:n_duplicated_proteins) { # iter = 11 3 aptamers
+#   protein_i <- duplicated_proteins[iter] # select current protein
+#   seqIDs_i <- target_protein_duplicated %>% # obtaining the seqIDs
+#     filter(TargetFullName == protein_i) %>%
+#     select(AptName) %>% unlist
+#   data_i <- somascan_normalized_clean_features_log_scale[, seqIDs_i] # subsetting the data
+# 
+#   corrmat <- cor(data_i) # computing the correlation
+#   up <- upper.tri(corrmat) # upper triangular entries
+#   
+#   protein1 <- c(protein1, rownames(corrmat)[row(corrmat)[up]])
+#   protein2 <- c(protein2, rownames(corrmat)[col(corrmat)[up]])
+#   corrs_duplicated <- c(corrs_duplicated, corrmat[up])
+# }
+# 
+# # combining everything into 1 table
+# duplicated_cor_table <- cbind.data.frame(protein1 = protein1,
+#                                          protein2 = protein2,
+#                                          corr = corrs_duplicated)
+# save(duplicated_cor_table, file = paste0(somascan_wd, "CorrelationsBetweenDuplicatedProteinsTable.rda"))
+
+load(paste0(somascan_wd, "CorrelationsBetweenDuplicatedProteinsTable.rda"))
+hist(duplicated_cor_table$corr, main = "Correlations Between Duplicated Proteins", xlab = "Correlations")
+```
+
+### Paired t-tests
+
+We apply paired t-tests to matched case-control pairs to compare protein levels between the two groups. We found that no proteins were different at the 5% or 10% FDR threshold. There were 2 proteins that were significant at the 20% threshold and 2 more that were just above the 20% threshold. These were Calcium-binding and coiled-coil domain-containing protein 2 and Dipeptidase 2. The two proteins that just missed the 20% cut-off were Ephrin type-B receptor 4 and Interferon alpha/beta receptor 1.
+
+There were 481 proteins that were significantly different at the 5% level between the groups before adjustment. Based on the histogram of p-value, we see a distribution that does not look uniform. This suggests there are several protein features that are significantly different between cases and controls. We estimate that the proportion of features which are non-null to be 35.8%, as determined by the $\pi_0$ estimation method proposed by Storey (2002). 
+
+```{r Paired T-Testing, message = FALSE, eval = FALSE}
+# Creating a dataframe to store the results
+case_control_t.test_res <- data.frame(test.stat = numeric(n_proteins),
+                                      p.value = numeric(n_proteins))
+
+for (i in 1:n_proteins) { # iterating through each protein
+  # the current protein
+  protein_i <- aptamers[i]
+  
+  # extracting the case and control ids
+  case_ids <- clinical_data_soma$id[clinical_data_soma$ccstat == 1]
+  control_ids <- clinical_data_soma$id[clinical_data_soma$ccstat == 2]
+  
+  # subsetting the protein i levels for cases and controls
+  case_protein_i <- somascan_normalized_clean_features_log_scale[which(rownames(somascan_normalized_clean_features_log_scale) %in% case_ids), protein_i]
+  control_protein_i <- somascan_normalized_clean_features_log_scale[which(rownames(somascan_normalized_clean_features_log_scale) %in% control_ids), protein_i]
+  
+  # performing the paired t-test
+  res_i <- t.test(case_protein_i, control_protein_i, paired = TRUE)
+  
+  # storing the results
+  case_control_t.test_res$test.stat[i] <- res_i$statistic
+  case_control_t.test_res$p.value[i] <- res_i$p.value
+}
+
+# Adjusting the p-values for multiple comparisons
+p.values <- case_control_t.test_res$p.value
+names(p.values) <- aptamers
+case_control_t.test_fdr_adjust <- p.adjust(p.values, method = "fdr")
+
+# checking if any are < 0.05
+any(case_control_t.test_fdr_adjust < 0.05)
+any(case_control_t.test_fdr_adjust < 0.1)
+any(case_control_t.test_fdr_adjust < 0.2)
+
+# which were significant?
+case_control_t.test_fdr_adjust[case_control_t.test_fdr_adjust < 0.2]
+
+# were any significant before FDR adjustment?
+any(p.values < 0.05)
+sum(p.values < 0.05)
+
+# renaming the p.value vector to have the target names instead of the seqIDs
+p.values.names <- p.values # create new vector
+names(p.values.names) <- UniProtIDs
+
+# saving both versions of the p-value vector
+save(p.values, p.values.names, case_control_t.test_fdr_adjust, case_control_t.test_res,
+     file = paste0(somascan_wd, "UnivariatePValuesUncombined.rda"))
+```
+```{r Paired T-Testing Results, message = FALSE, warning = FALSE}
+# -----------------------------------------------------------------------------
+# Table for the results
+# -----------------------------------------------------------------------------
+load(paste0(somascan_wd, "CaseControl_ORA/UnivariatePValuesUncombined.rda"), verbose = TRUE)
+
+t.test_tab <- data.frame(seqID = character(n_proteins),
+                         Target.Name = character(n_proteins),
+                         UniProtID = character(n_proteins),
+                         Test.Stat = numeric(n_proteins),
+                         P.value = numeric(n_proteins),
+                         Q.value = numeric(n_proteins))
+t.test_tab$seqID <- names(p.values)
+t.test_tab$P.value <- p.values
+t.test_tab$Q.value <- case_control_t.test_fdr_adjust
+t.test_tab$Target.Name <- protein_target_names
+t.test_tab$Test.Stat <- case_control_t.test_res$test.stat
+t.test_tab$UniProtID <- UniProtIDs
+t.test_tab <- t.test_tab[order(t.test_tab$Q.value, decreasing = FALSE), ]
+
+# Presenting the table
+table_to_print <- kable(t.test_tab, format = "html", align = 'c',
+      caption = "Paired t-test p-values and FDR-adjusted q-values for each protein/. Results shown here are from univariate testing done aptamer-by-aptamer. Note that some aptamers correspond to the same protein.") %>% kable_styling(full_width = F)
+scroll_box(table_to_print, height = "500px")
+
+# Histogram of the p-values
+hist(p.values, breaks = 25, xlab = "P-values", main = "Histogram of P-values \n from Paired T-tests")
+
+# Estimating the proportion of true null p-values
+null.ratio <- pi0est(p.values)
+nonnull.ratio <- 1 - null.ratio$pi0
+```
+
+The results shown above are at the aptamer level, meaning each test statistic and p-value corresponds to comparing the difference mean aptamer level by case and control grouping. We next combine these results across the aptamers that map to the same protein using Fisher's method. Fisher's method combines p-values to obtain a Chi-squared test statistic, which has degrees of freedom equal to 2 times the number of p-values combined. These are combined across the 3872 unique protein targets in our dataset. 
+
+```{r Paired T-Testing (Results Combined Within Protein Targets), message = FALSE, warning = FALSE}
+# Init
+chisq_combined <- c() # to store the combined p-values -> chi-squared test stats
+pvalues_combined <- c() # To store the p-values that correspond to chisq_combined
+protein_order <- c() # to store the order in which proteins go
+df_for_test_stats <- c() # storing the df for the test statistics
+proteins <- names(p.values.names) # storing the true protein target names (including duplicates)
+ind <- 1 # index for storing values
+
+for (i in 1:n_proteins) {
+  # Save the current protein
+  protein_i <- proteins[i]
+  
+  # Have we seen this protein before?
+  seen_before <- protein_i %in% protein_order
+  
+  # Is this protein duplicated?
+  # protein_duplicated <- protein_i %in% duplicated_proteins
+  
+  # If not seen before:
+  if (!seen_before) {
+    
+    # Combining on the original data
+    all_pvalues_i <- p.values.names[names(p.values.names) %in% protein_i] # obtaining all p-values
+    combined_pvalue_i <- -2*sum(log(all_pvalues_i)) # combining them
+    chisq_combined[ind] <- combined_pvalue_i # storing them
+    protein_order[ind] <- protein_i # saving the current protein
+    df_for_test_stats[ind] <- 2*length(all_pvalues_i)
+    pvalues_combined[ind] <- pchisq(chisq_combined[ind], df = df_for_test_stats[ind], lower.tail = FALSE)
+    
+    # Update counter for the index
+    ind <- ind + 1
+  }
+}
+
+# Adding the names
+names(chisq_combined) <- names(pvalues_combined) <- protein_order
+
+# Creating a new table with the results
+t.test.combined_tab <- data.frame(UniProtID = character(length(protein_order)),
+                                  ChiSq.Stat = numeric(length(protein_order)), # From Fisher's method
+                                  P.value = numeric(length(protein_order)), # From Fisher's method
+                                  Q.value = numeric(length(protein_order))) # FDR applied to Fisher's method
+
+# Filling in the table with P-values, Q-values, Chi-squared test stats, and UniProt Ids
+t.test.combined_tab$P.value <- pvalues_combined
+t.test.combined_tab$Q.value <- p.adjust(pvalues_combined, method = "fdr")
+t.test.combined_tab$ChiSq.Stat <- chisq_combined
+t.test.combined_tab$UniProtID <- names(chisq_combined)
+
+# Ordering by Q-Value
+t.test.combined_tab <- t.test.combined_tab[order(t.test.combined_tab$Q.value, decreasing = FALSE), ]
+
+# Presenting the table
+kable(t.test.combined_tab, format = "html", align = 'c',
+      caption = "Paired t-test p-values and FDR-adjusted q-values for each protein combined within proteins. These results are at the protein, rather than the aptamer, level.") %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+We also considered the 239 proteins identified in the lung obtained from [The Protein Atlas](https://www.proteinatlas.org/humanproteome/tissue/lung) to see where they fall in our dataset. We were abe to match 113 proteins between the two datasets using the UniProt ID. But this includes some proteins we may have excluded from our analysis. 
+
+```{r Protein Atlas, warning = FALSE, message = FALSE}
+# Loading in the protein atlas data
+protein_atlas_lung_proteins <- read_tsv(paste0(somascan_wd, "ProteinAtlasListOf239LungProteins.tsv"))
+
+# Checking if any proteins match between the Protein Atlas dataset and the Somascan dataset
+# Using UniProt
+any(protein_atlas_lung_proteins$Uniprot %in% somascan_annotations$`UniProt ID`)
+sum(protein_atlas_lung_proteins$Uniprot %in% somascan_annotations$`UniProt ID`)
+
+# Using Ensembl
+any(protein_atlas_lung_proteins$Ensembl %in% somascan_annotations$`Ensembl Gene ID`)
+sum(protein_atlas_lung_proteins$Ensembl %in% somascan_annotations$`Ensembl Gene ID`)
+
+# Checking if any proteins match to the ones we included in our dataset
+# Using UniProt
+any(protein_atlas_lung_proteins$Uniprot %in% t.test_tab$UniProtID)
+sum(protein_atlas_lung_proteins$Uniprot %in% t.test_tab$UniProtID)
+
+# Redoing the FDR correction for this set of proteins
+t.test.res.atlas <- t.test_tab[t.test_tab$UniProtID %in% protein_atlas_lung_proteins$Uniprot,]
+p.values.atlas <- t.test.res.atlas$P.value
+t.test.res.atlas$Q.value <- p.adjust(p.values.atlas, method = "fdr")
+
+table_to_print_pa <- kable(t.test.res.atlas, 
+                           format = "html", align = "c",
+      caption = "Paired t-test p-values and FDR-adjustedq-values for just the proteins identified on the Protein Atlas. FDR-correction redone on smaller set of Protein Atlas proteins.") %>%
+  kable_styling(full_width = F)
+scroll_box(table_to_print_pa, height = "500px")
+```
+
+### Permutation Testing with Case-Control Status
+
+We'd like to use the paired t-test results to filter proteins into a pathway overrepresentation analysis. However, because we have aptamers that map to the same protein, it is not clear how to do so fairly. We opted for a permutation testing approach, that alleviates the need for assumptions on normality and allows us to combine results across aptamers. The approach is as follows:
+
+\begin{itemize}
+  \item First, compute the paired t-test p-values comparing cases and controls for each aptamer
+  \item Combine these p-values using Fisher's method, i.e. for each protein, obtain all $k$ aptamers that correspond to it and compute $-2\sum_{i=1}^k \log p_i$. It is possible that $k = 1$. 
+  \item Then, for 10000 iterations:
+  \begin{itemize}
+    \item Randomly scramble the case-control labels within each pair
+    \item Compute a paired t-test comparing cases and controls for each aptamer under this new labeling scheme
+    \item Save the p-value
+  \end{itemize}
+  \item After 10000 iterations, we should have 10000 p-values for each aptamer
+  \item For each protein and each iteration, combine the p-values using Fisher's method again, i.e. for each protein, obtain all $k$ aptamers that correspond and compute $-2\sum_{i=1}^k \log p_i$. Should result in 10000 combined p-values for each protein 
+  \item Compare the original combined p-value to the combined permutation p-values by computing the permutation testing p-value for each protein, $p^{permute}_{\ell}$, $\ell = 1, \do    ts, 4253$: $p^{permute}_{\ell} = \sum_{i=1}^{10000} \frac{\text{(# times permutation combined p-value > original combined p-value) + 1 }}{10000 + 1}$
+\end{itemize}
+
+We used the UniProt ID to uniquely identify proteins. Protein target names were not necessarily unique and there were multiple versions of certain proteins corresponding to different post-transcriptional modifications that Chris said were not of interest in maintaining. 
+
+In doing so, we obtained 467 proteins that had p-values below 0.05 under permutation testing, displayed below. We would expect that this value and the protein p-values should stay fairly consistent if do a second replication at 10000 iterations. However, we would expect to see some changes as we go from 500 to 1000 to 10000. \\
+
+We also specifically investigated the protein SP-D, which had 2 aptamers that map to it. One aptamer was significant prior to FDR adjustment while the other was not significant prior to FDR adjustment. The combined permutatino testing p-value for SP-D was 0.096. 
+
+```{r Permutation Testing Code from Server, eval = FALSE}
+# Just for our records, I am including a source() for the server permutation testing
+source(paste0(somascan_wd, "Permutation_Testing.R"))
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Pathway Analysis {.panel-title}
+## {.panel-body}
+
+First, we export the data to input in Impala. We start by exporting the proteins that were significant after permutation testing. For pathway analysis, we submit a set of proteins that were significant and a set of reference proteins that went into our permutation testing analysis. 
+
+```{r Permutation Testing Results Using Case-Control Status, message = FALSE, warning = FALSE}
+# -----------------------------------------------------------------------------
+# Exporting combined permutation p-values for pathway analysis
+# -----------------------------------------------------------------------------
+
+# Loading in the permutation testing p-values 
+# (after comparing the original combined p-values to those from permutation testing)
+load(paste0(somascan_wd, "CaseControl_ORA/combined_permutation_pvalues_10k.rda"), verbose = TRUE)
+
+# FDR correction on the permutation p-values
+permutation_pvalues_fdr <- p.adjust(permutation_pvalues, method = "fdr")
+
+# Which were < 0.05?
+significant_proteins <- permutation_pvalues[permutation_pvalues < 0.05]
+
+# Display
+significant_proteins_tab <- data.frame(Protein = character(length(significant_proteins)),
+                                       UniProtID = names(significant_proteins),
+                                       PermutationPValue = significant_proteins,
+                                       QValue = permutation_pvalues_fdr[permutation_pvalues < 0.05])
+
+# Add in the protein target names
+proteins_temp <- protein.names.tab.reorder %>% 
+  filter(`UniProt ID` %in% significant_proteins_tab$UniProtID) 
+proteins_temp <- proteins_temp[!duplicated(proteins_temp$`UniProt ID`),] # Remove duplicates
+proteins_temp <- proteins_temp[match(significant_proteins_tab$UniProtID,
+                                     proteins_temp$`UniProt ID`),]
+significant_proteins_tab$Protein <- proteins_temp$`Target Name`
+
+significant_proteins_tab <- significant_proteins_tab[order(significant_proteins_tab$PermutationPValue, decreasing = FALSE),]
+rownames(significant_proteins_tab) <- NULL
+
+significant_proteins_tab %>% kable(format = "html", align = "c",
+                                   col.names = c("Protein", "UniProt ID", "Permutation P-Value", "Q-Value"),
+      caption = "Proteins with significant permutation testing p-values after using Fisher's method to combine p-values across aptamers and their associated Q-value after FDR correction.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# 
+
+# Creating a histogram of the p-values
+hist(permutation_pvalues, 
+     main = "Permutation Testing P-values", xlab = "P-Value",
+     breaks = 15)
+```
+```{r Saving Significant Proteins Between Case-Control for ORA, warning = FALSE, message = FALSE}
+# -----------------------------------------------------------------------------
+# Saving the proteins that were significant after permutation testing to 
+# enter into pathway analysis. 
+# -----------------------------------------------------------------------------
+
+# We don't need the proteins to be in a particular order or anything, we can just
+# submit the UniProt IDs.
+
+# Saving the UniProt IDs in a text file to upload
+UniProtID_file <- file(paste0(somascan_wd, "UniProtIDs_for_Significant_Proteins_Permutation_Testing10k.txt"))
+writeLines(names(significant_proteins), UniProtID_file)
+close(UniProtID_file)
+
+# Saving the reference file to upload
+UniProtID_reference_file <- file(paste0(somascan_wd, "UniProtIDs_for_Reference_Proteins.txt"))
+writeLines(names(permutation_pvalues), UniProtID_reference_file)
+close(UniProtID_reference_file)
+```
+```{r Investigating SP-D, message=FALSE, warning=FALSE}
+# -----------------------------------------------------------------------------
+# Investigating the SP-D protein
+# -----------------------------------------------------------------------------
+
+# The permutation p-value for SP-D (UniProt ID == P35247) after combining across aptamers
+permutation_pvalues[names(permutation_pvalues) == "P35247"]
+
+# Compared to the paired t-testing for each aptamer corresponding to SP-D
+t.test_tab[t.test_tab$Target.Name == "SP-D",]
+```
+
+Using the proteins that were significant at the 0.05 level with permutation testing (prior to FDR adjustment), we pass these proteins along to pathway analysis using Impala software. We considered both gene overrepresentation analysis and gene enrichment analysis, but did not move forward with enrichment analysis. 467 proteins were significant at the 0.05 level and went into pathway analysis. 
+
+The first set of results we investigate are the overrepresentation analysis results. 2471 pathways were considered in this analysis, with only one pathway significant at the 0.2 level after multiple comparisons correction. 386 out of 467 input proteins were mapped to 390 distinct proteins found in the pathways. The background gene size was 3072, indicating that some protein IDs in the reference set were not considered in the anaylsis. 2469 pathways were found. 
+
+The method for multiple comparisons adjustment used by the Impala software does not appear to match the FDR correction done in R, though the accompanying article [here](https://academic.oup.com/bioinformatics/article/27/20/2917/202905) claims the software applies a Benjamini-Hochberg FDR correction. 
+
+Considering how many pathways were considered in the analysis, it is likely that many are unlikely to be related to COPD pathogenesis and as a result of considering them, we lose power to detect the truly overrepresented pathways. We considered filtering based on the pathway size, but I have omitted those results here. 
+
+```{r Pathway Analysis After Permutation Testing with Case-Control Status, message = FALSE, warning = FALSE}
+# -----------------------------------------------------------------------------
+# Pathway overrepresentation analysis
+# -----------------------------------------------------------------------------
+
+# Loading in the results from Impala
+overrep_results <- read.csv(paste0(somascan_wd, "CaseControl_ORA/Somascan_Pathway_Analysis_Results_With_Reference_Using_Uniprot.csv"))
+
+# Checking how many were significant
+sum(overrep_results$P_genes < 0.05)
+
+# Remove the overlapping genes column
+overrep_results <- overrep_results[,!(colnames(overrep_results) %in% "overlapping_genes")]
+
+# Checking that Impala uses a Benjamini-Hochberg FDR correction
+overrep_results_fdr <- p.adjust(overrep_results$P_genes, method = "fdr")
+
+# Adding the p.adjust FDR correction to the table
+overrep_results$Q_genes_fdr <- overrep_results_fdr
+
+# Printing the results in a table
+overrep_results %>% kable(format = "html", align = "c",
+                          col.names = c("Pathway", "Source", "# Overlapping Genes", 
+                                        "# All Pathway Genes", 
+                                        "P-Value", "Q-Value", "Q-Value (FDR)"),
+      caption = "Pathway overrepresentation results using case-control status as an outcome, ordered from most significant to least.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Multivariate Analyses Using Case-Control Status {.panel-title}
+## {.panel-body}
+
+### Distance-Weighted Discrimination
+
+Next, we apply distance weighted discrimination (DWD) to assess how well all the proteins together can distinguish between cases and controls. This differs from the goal of our univariate t-tests because those determine if any individual protein differs between cases and controls, while DWD determines if all the proteins as a whole can distinguish between cases and controls. After cross validation based on the pairs, we calculated a 0.055 p-value comparing the scores between the two groups. This is evidence of weak separation between cases and controls. 
+
+```{r Cross-Validated DWD, message = FALSE, eval = FALSE}
+library("SparseM")
+library("DWDLargeR")
+
+# -----------------------------------------------------------------------------
+# Cross-validated DWD
+# -----------------------------------------------------------------------------
+
+# Creating a vector of case-control labels, either -1 or 1
+case_control_labels <- ifelse(clinical_data_soma$ccstat == 1, 1, -1) # change cases to 1, controls to -1
+
+# Changing the form of the data (not sure why Adam did this)
+somascan_normalized_clean.DWD <- SparseM::`[.matrix.csr`(somascan_normalized_clean_features_log_scale)
+
+# Adjusting the penalty parameter
+penalty.proteo <- DWDLargeR::penaltyParameter(X = somascan_normalized_clean.DWD,
+                                              y = case_control_labels,
+                                              expon = 1)
+
+# Cross-validated DWD:
+# Iterating through each case-control pair
+ind_of_pairs <- seq(from = 1, to = length(case_control_labels), by = 2)
+cv.scores <- lapply(ind_of_pairs, function(i) {
+  # For each case-control pair, i
+  w.vec = genDWD(X = t(somascan_normalized_clean.DWD[-c(i, i+1), ]),
+                 y = case_control_labels[-c(i, i+1)],
+                 expon = 1,
+                 C = penalty.proteo,
+                 scaleFea = FALSE)$w
+  cv.scores = w.vec%*%t(somascan_normalized_clean.DWD[c(i, i+1),])
+  cv.scores
+})
+
+cv.scores.mat <- matrix(unlist(cv.scores), ncol = 2, byrow = T)
+colnames(cv.scores.mat) <- c("case", "control")
+case_control_dwd_t.test <- t.test(x = cv.scores.mat[,1], y = cv.scores.mat[,2],
+                                  paired = TRUE,
+                                  alternative = "greater")
+case_control_dwd_t.test$p.value
+
+save(cv.scores, cv.scores.mat, case_control_dwd_t.test,
+     file = paste0(somascan_wd, "CrossValidatedDWDResults.rda"))
+```
+```{r Cross-Validated DWD Results, message=FALSE, warning = FALSE}
+library(lattice)
+library(viridis)
+
+# Load in teh results
+load(paste0(somascan_wd, "DWD/CrossValidatedDWDResults.rda"))
+
+# Relabel cases and controls
+case_control_labels <- ifelse(clinical_data_soma$ccstat == 1, 1, -1) # change cases to 1, controls to -1
+case_control_labels_character <- ifelse(case_control_labels == 1, "Case", "Control")
+
+# Plot
+densityplot(~unlist(cv.scores), group = case_control_labels_character,
+            xlab = "DWD Scores", col = viridis(2), auto.key = TRUE,
+            par.settings=simpleTheme(col=viridis(2)),
+            main = "Densities of Predicted Case-Control Groupings \n Based on DWD on Lavage Proteomics")
+```
+
+### Sparse Distance-Weighted Discrimination
+
+For comparison, we also considered sparse DWD which forces some weights on the proteins to be 0. This can reduce some noise and provide better results. We can also get a sense of which proteins are important in classifying cases and controls. We start by fitting sDWD on the full training dataset to see which proteins have non-zero weight. We found 10 proteins to have non-zero weight, meaning these 10 proteins contribute to separating cases and controls. 
+
+```{r Sparse DWD on Training Data, message = FALSE, warning = FALSE} 
+library(sdwd)
+
+# -----------------------------------------------------------------------------
+# Running sDWD on the full training dataset to determine which proteins have 
+# non-zero weights
+# -----------------------------------------------------------------------------
+
+# Fit with cross-validation to obtain the penalty parameters
+cv.fit <- cv.sdwd(x = somascan_normalized_clean_features_log_scale,
+                  y = case_control_labels,
+                  standardize = FALSE, # already standardized
+                  eps = 1e-12) # higher convergence threshold
+
+# Obtain the betas from the sDWD with the lambda that minimized cross validation error
+min.iter <- which(cv.fit$sdwd.fit$lambda == cv.fit$lambda.min)
+beta.cv <- matrix(cv.fit$sdwd.fit$beta[,min.iter], nrow = 1)
+
+which(beta.cv != 0)
+
+# Which coefficients were non-zero?
+nzero.beta <- which(beta.cv != 0)
+nzero.seqids <- protein.names.tab.reorder[nzero.beta,]
+nzero.seqids$Weights <- beta.cv[,nzero.beta]
+
+# Sorting the table from highest to lowest weight
+nzero.seqids <- nzero.seqids[order(nzero.seqids$Weights, decreasing = TRUE), ]
+
+# Table to display
+nzero.seqids %>% kable(format = "html", align = "c",
+      caption = "Proteins with non-zero weights in sparse DWD fit on the full training dataset.") %>% 
+  kable_styling(full_width = F)
+```
+
+We then used leave-a-pair-out cross validation with sDWD. At each iteration, we held out a case-control pair, fit the model with cross validation on the remaining pairs to find the best penalty parameter value (the one that minimizes missclassification error). Then we fit the model with the corresponding penalty parameter and weights on the held-out pair and save their score. 
+
+Using a paired t-test, we compare the scores calculated for case-control pairs from cross validation. The paired t-test p-value comparing the cross-validated scores from sparse DWD was 0.0027, indicating much stronger separation than with regular DWD. Separation on the scores density plot is more apparent than with the original DWD.  
+
+```{r Cross-Validated Sparse DWD, warning = FALSE, message = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Running sDWD with leave-a-pair-out cross validation to assess model accuracy
+# -----------------------------------------------------------------------------
+library(sdwd)
+
+ind_of_pairs <- seq(from = 1, to = length(case_control_labels), by = 2)
+cv.scores.betas.sparse <- lapply(ind_of_pairs, function(i) {
+  # For each case-control pair, i
+  fit <- cv.sdwd(x = somascan_normalized_clean_features_log_scale[-c(i, i+1), ],
+              y = case_control_labels[-c(i, i+1)],
+              standardize = FALSE) # already standardized
+  min.iter <- which(fit$sdwd.fit$lambda == fit$lambda.min)
+  beta.cv <- matrix(fit$sdwd.fit$beta[,min.iter], nrow = 1)
+  cv.scores <- beta.cv %*% t(somascan_normalized_clean_features_log_scale[c(i, i+1),])
+  # cv.scores
+  # Returning both the score and the beta vector
+  list(beta.cv = beta.cv, cv.scores = cv.scores)
+})
+
+# Saving the scores
+cv.scores.sparse <- lapply(cv.scores.betas.sparse, function(ind) ind$cv.scores)
+cv.scores.sparse.mat <- matrix(unlist(cv.scores.sparse), ncol = 2, byrow = T)
+colnames(cv.scores.sparse.mat) <- c("case", "control")
+case_control_sparse_dwd_t.test <- t.test(x = cv.scores.sparse.mat[,1], y = cv.scores.sparse.mat[,2],
+                                         paired = TRUE,
+                                         alternative = "greater")
+case_control_sparse_dwd_t.test$p.value
+
+# Saving the resulting betas
+cv.betas.sparse <- lapply(cv.scores.betas.sparse, function(ind) ind$beta.cv)
+
+save(cv.scores.sparse, cv.scores.sparse.mat, case_control_sparse_dwd_t.test, cv.betas.sparse,
+     file = paste0(somascan_wd, "CrossValidatedSparseDWDResults.rda"))
+```
+```{r Cross-Validated Sparse DWD Results}
+library(lattice)
+
+# Load in results
+load(paste0(somascan_wd, "DWD/CrossValidatedSparseDWDResults.rda"), verbose = TRUE)
+
+# Relabel cases and controls
+case_control_labels <- ifelse(clinical_data_soma$ccstat == 1, 1, -1) # change cases to 1, controls to -1
+case_control_labels_character <- ifelse(case_control_labels == 1, "Case", "Control")
+
+# Plot
+library(viridis)
+cols <- viridis(5)[c(1,3)]
+densityplot(~unlist(cv.scores.sparse), group = case_control_labels_character,
+            xlab = "DWD Scores", col = cols, auto.key = TRUE,
+            par.settings=simpleTheme(col=cols),
+            main = "Densities of Sparse DWD Scores \n Based on Lavage Protein Expression")
+```
+
+We also consider the resulting betas from each cross-validated run. From this, we can observe the proportion of times a particular protein has a non-zero coefficient. 
+
+```{r Cross-Validated Sparse DWD Proportion Selected, warning = FALSE, message = FALSE}
+# -----------------------------------------------------------------------------
+# Checking the proportion of times the betas in each run are non-zero
+# -----------------------------------------------------------------------------
+
+# Load in the results
+load(paste0(somascan_wd, "DWD/CrossValidatedSparseDWDResults.rda"), verbose = TRUE)
+
+# Saving the indices of each case-control pair
+ind_of_pairs <- seq(from = 1, to = length(case_control_labels), by = 2)
+
+# Combining the betas into a matrix
+cv.betas.sparse.mat <- matrix(unlist(cv.betas.sparse), ncol = n_proteins, nrow = length(ind_of_pairs), byrow = T)
+colnames(cv.betas.sparse.mat) <- protein_target_names
+
+# Calculating how many times each protein had a non-zero coefficients out of 26 cross-validated runs
+count_non_zero <- apply(cv.betas.sparse.mat, 2, function(col) sum(col != 0))
+prop_non_zero <- count_non_zero/length(ind_of_pairs)
+
+# Calculating the column means (the average weight for each protein across the cross-validated iterations)
+mean_weight_cv <- colMeans(cv.betas.sparse.mat)
+
+# Displaying the proteins who had non-zero coefficients for > 0% of the time
+cv.betas.sparse.tab <- cbind.data.frame(Protein = names(prop_non_zero[prop_non_zero > 0]),
+                                        Proportion = prop_non_zero[prop_non_zero > 0],
+                                        AverageWeight = mean_weight_cv[prop_non_zero > 0])
+cv.betas.sparse.tab <- cv.betas.sparse.tab[order(cv.betas.sparse.tab$Proportion, decreasing = TRUE),]
+
+# Display
+cv.betas.sparse.tab[cv.betas.sparse.tab$Proportion > 0.5,] %>% kable(format = "html", align = "c",
+      caption = "After cross validation of sDWD, the proteins which had non-zero coefficients some proportion of the cross-validation iterations.") %>% 
+  kable_styling(full_width = F)
+```
+
+As a sanity check, we checked the overlap of selected proteins between the (1) permutation testing, and (2) the original paired t-tests to determine if our results appear to be consistent between the two approaches. We also consider the similarity between these approaches and using sparse DWD on the full training dataset. 
+
+There were 9 proteins that were significant from permutation testing that were also significant at an FDR threshold of 0.2 using just the proteins enriched in the lung according to the Protein Atlas dataset. There were 2 such proteins when considering all proteins that were significant at an FDR threshold of 0.2, not just those listed in the Protein Atlas. This makes sense because only 2 proteins were signficant at an FDR threshold of 0.2 and none were significant at stricter thresholds. It seems that univariate testing assuming the t-test conditions hold and applying an FDR threshold is very stringent. Prior to FDR correction, there was an overlap of 424 proteins so 90% of the proteins selected from permutation testing were also significant under t-testing prior to multiple testing adjustment. There was an overlap of 10 proteins considering those with non-zero weight from sparse DWD run on the full training data. 
+
+```{r Overlap of Results, warning = FALSE, message = FALSE, eval = FALSE}
+# Checking the overlap in selected proteins from the paired t-tests with the permutation testing --
+
+# Considering just the protein atlas proteins with FDR correction
+overlap_permutation_testing_ttests <- 
+  intersect(significant_proteins_tab$Protein, # permutation testing
+            t.test.res.atlas[t.test.res.atlas$Q.value < 0.2,]$UniProtID) # protein atlas proteins with FDR
+
+length(overlap_permutation_testing_ttests)
+
+# Considering all proteins with FDR correction
+overlap_permutation_testing_ttests2 <- 
+  intersect(significant_proteins_tab$Protein, # permutation testing
+            t.test_tab[t.test_tab$Q.value < 0.2,]$UniProtID) # all proteins with FDR
+
+length(overlap_permutation_testing_ttests2)
+
+# Considering all proteins before FDR correction
+overlap_permutation_testing_ttests_no_fdr <- 
+  intersect(significant_proteins_tab$Protein, # permutation testing
+            t.test_tab[t.test_tab$P.value < 0.05,]$UniProtID) # all proteins pre-FDR
+
+length(overlap_permutation_testing_ttests_no_fdr)
+
+# Considering the resulting proteins from sDWD fit on the full training data
+overlap_permutation_testing_ttests_sdwd <- 
+  intersect(significant_proteins_tab$Protein, # permutation testing
+            nzero.seqids$`UniProt ID`) # sDWD selected proteins
+
+length(overlap_permutation_testing_ttests_sdwd)
+``` 
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Considering FEV1pp as an Outcome {.panel-title}
+## {.panel-body}
+
+We now consider FEV1-percent-predicted as an outcome instead of binary case-control status. We start by considering the Pearson correlation between each protein and FEV1pp. After multiple comparisons adjustment, we found 649 proteins that were significantly correlated with FEV1pp at the 0.05 level, 1047 at the 0.1 level, and 1689 at the 0.2 level. I initially used the Holm adjustment before the FDR adjustment, and the significance after correction was FAR lower. I expect this is because the Holm approach controls the familywise error rate, which is more conservative than controlling the FDR rate. 
+
+### Pearson Correlation Tests
+
+As a first measure of the relationship between each protein and FEV1pp, we consider univariate Pearson correlation tests between each protein and FEV1pp. We later iterate on this and consider a permutation framework in which we do this but with permutations of the FEV1pp values within each case-control pair. 
+
+```{r FEV1pp Pearson Correlation Tests, message = FALSE, warning = FALSE}
+# -----------------------------------------------------------------------------
+# Correlations between proteins and FEV1pp
+# -----------------------------------------------------------------------------
+
+# First, checking the order still matches between the clinical and protein data --
+all(somascan_normalized_clean$PID == clinical_data_soma$id)
+
+# And check that the aptamers match to the name table
+all(aptamers == protein.names.tab.reorder$SeqID)
+
+# Computing the correlations between each metabolite (each row in the lavage data)
+# with FEV1_percent_predicted
+corr_fev1pp_proteins <- data.frame(SeqID = character(n_proteins),
+                                   Protein = character(n_proteins),
+                                   UniProtID = character(n_proteins),
+                                   Correlation = numeric(n_proteins),
+                                   Test.Stat = numeric(n_proteins),
+                                   P.Value = numeric(n_proteins),
+                                   Q.Value = numeric(n_proteins))
+
+for (i in 1:n_proteins) {
+  # Save the current protein data
+  seqID_i <- aptamers[i]
+  protein_i <- protein.names.tab.reorder$`Target Name`[i]
+  uniprot_i <- protein.names.tab.reorder$`UniProt ID`[i]
+    
+  # Calculate correlation
+  corr_i <- cor.test(somascan_normalized_clean_features_log_scale[,i], 
+                     clinical_data_soma$FEV1_percent_predicted)
+  
+  # Save results
+  corr_fev1pp_proteins$SeqID[i] <- seqID_i
+  corr_fev1pp_proteins$Protein[i] <- protein_i
+  corr_fev1pp_proteins$UniProtID[i] <- uniprot_i
+  corr_fev1pp_proteins$Correlation[i] <- corr_i$estimate
+  corr_fev1pp_proteins$Test.Stat[i] <- corr_i$statistic
+  corr_fev1pp_proteins$P.Value[i] <- corr_i$p.value
+}
+
+# Applying an FDR correction
+corr_fev1pp_proteins$Q.Value <- p.adjust(corr_fev1pp_proteins$P.Value, method = "fdr")
+
+# Sorting the rows in order of Q-value
+corr_fev1pp_proteins_reorder <- corr_fev1pp_proteins
+corr_fev1pp_proteins_reorder <- corr_fev1pp_proteins_reorder[order(corr_fev1pp_proteins_reorder$Q.Value, decreasing = FALSE),]
+
+# Adding indices for the rows
+rownames(corr_fev1pp_proteins_reorder) <- 1:n_proteins
+
+# How many were below each threshold?
+sum(corr_fev1pp_proteins_reorder$Q.Value < 0.05)
+sum(corr_fev1pp_proteins_reorder$Q.Value < 0.1)
+sum(corr_fev1pp_proteins_reorder$Q.Value < 0.2)
+
+# Table:
+# Creating the table to be a scroll box
+kable(corr_fev1pp_proteins_reorder, format = "html", align = 'c',
+      caption = "Correlation between proteins and FEV1 percent predicted. P-values were adjusted for multiple testing using an FDR correction.") %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# Saving the p-values from the correlation tests on the original data
+corr.p.values <- corr_fev1pp_proteins$P.Value
+names(corr.p.values) <- corr_fev1pp_proteins$SeqID
+corr.p.values.names <- corr.p.values
+names(corr.p.values.names) <- corr_fev1pp_proteins$UniProtID
+save(corr.p.values, corr.p.values.names, file = "/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/PValuesCorrFEV1ppUncombined.rda")
+```
+
+<!-- The above table shows the results aptamer-by-aptamer, where we consider the correlation of each aptamer with FEV1pp. Since more than one aptamer may correspond to the same protein, we combine the p-values from aptamers correspond to the same protein using Fisher's method.  -->
+
+<!-- I removed the following table because I think it cluttered the write-up. -->
+
+```{r FEV1pp Pearson Correlation Tests (Combined Within Proteins), message = FALSE, warning = FALSE, include = FALSE}
+# Init
+chisq_combined_corr <- c() # to store the combined p-values -> chi-squared test stats
+pvalues_combined_corr <- c() # To store the p-values that correspond to chisq_combined
+protein_order_corr <- c() # to store the order in which proteins go
+df_for_test_stats_corr <- c() # storing the df for the test statistics
+proteins <- names(corr.p.values.names) # storing the true protein target names (including duplicates)
+ind <- 1 # index for storing values
+corrs <- corr_fev1pp_proteins$Correlation # Correlations to be averaged
+names(corrs) <- corr_fev1pp_proteins$UniProtID
+corrs_averaged <- c() # Initializing the vector to store the average correlations
+
+for (i in 1:n_proteins) {
+  # Save the current protein
+  protein_i <- proteins[i]
+  
+  # Have we seen this protein before?
+  seen_before <- protein_i %in% protein_order_corr
+  
+  # Is this protein duplicated?
+  # protein_duplicated <- protein_i %in% duplicated_proteins
+  
+  # If not seen before:
+  if (!seen_before) {
+    
+    # Combining on the original data
+    all_pvalues_i <- corr.p.values.names[names(corr.p.values.names) %in% protein_i] # obtaining all p-values
+    combined_pvalue_i <- -2*sum(log(all_pvalues_i)) # combining them
+    chisq_combined_corr[ind] <- combined_pvalue_i # storing them
+    protein_order_corr[ind] <- protein_i # saving the current protein
+    df_for_test_stats_corr[ind] <- 2*length(all_pvalues_i)
+    pvalues_combined_corr[ind] <- pchisq(chisq_combined_corr[ind], df = df_for_test_stats_corr[ind], lower.tail = FALSE)
+    
+    # Save the correlations
+    corrs_i <- corrs[names(corrs) %in% protein_i]
+    corrs_averaged[ind] <- mean(corrs_i)
+    
+    # Update counter for the index
+    ind <- ind + 1
+  }
+}
+
+# Adding the names
+names(chisq_combined_corr) <- names(pvalues_combined_corr) <- names(corrs_averaged) <- protein_order_corr
+
+# Creating a new table with the results
+cor.test.combined_tab <- data.frame(Protein = character(length(protein_order_corr)),
+                                    UniProtID = character(length(protein_order_corr)),
+                                    ChiSq.Stat = numeric(length(protein_order_corr)), # From Fisher's method
+                                    Avg.Corr = numeric(length(protein_order_corr)), 
+                                    P.value = numeric(length(protein_order_corr)), # From Fisher's method
+                                    Q.value = numeric(length(protein_order_corr))) # FDR applied to Fisher's method
+
+# Filling in the table with P-values, Q-values, Chi-squared test stats, and UniProt Ids
+cor.test.combined_tab$P.value <- pvalues_combined_corr
+cor.test.combined_tab$Q.value <- p.adjust(pvalues_combined_corr, method = "fdr")
+cor.test.combined_tab$ChiSq.Stat <- chisq_combined_corr
+cor.test.combined_tab$UniProtID <- names(chisq_combined_corr)
+cor.test.combined_tab$Avg.Corr <- corrs_averaged
+
+# Adding the target names
+protein.subset.names <- protein.names.tab.reorder %>% 
+  filter(`UniProt ID` %in% cor.test.combined_tab$UniProtID) %>% 
+  filter(!duplicated(`UniProt ID`)) %>%
+  arrange(match(cor.test.combined_tab$UniProtID, `UniProt ID`))
+
+# Check
+all(cor.test.combined_tab$UniProtID == protein.subset.names$`UniProt ID`)
+
+# Add the target names to the table
+cor.test.combined_tab$Protein <- protein.subset.names$`Target Name`
+
+# Ordering by Q-Value
+cor.test.combined_tab <- cor.test.combined_tab[order(cor.test.combined_tab$Q.value, decreasing = FALSE), ]
+
+# Presenting the table
+kable(cor.test.combined_tab, format = "html", align = 'c',
+      caption = "Correlation test with FEV1pp and FDR-adjusted q-values for each protein. These results are combined within each protein and thus are at the protein level, rather than the aptamer level.") %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# Selecting the proteins with the top highest permutation testing p-values 
+# to obtain their average correlation
+top_corr_ids <- c("Q13478", "P15086", "Q9NS68", "Q9NZU0", "O43921", "Q14677", "Q9Y6U3", 
+                          "Q86W26", "P08670", "P31997")
+
+cor.test.combined_tab %>% slice(match(top_corr_ids, cor.test.combined_tab$UniProtID)) %>%
+  dplyr::select(Avg.Corr) 
+```
+
+### Lasso Regression
+
+We then consider lasso regression with FEV1pp as an outcome. We first apply lasso to the full training data and then apply cross validation on the pairs and obtain predicted outcomes and average coefficients for each protein. There were 33 proteins with non-zero proteins when the lasso model was fit on the full training data and 83 proteins with non-zero average coefficient across the cross validation iterations. The correlation between the true FEV1pp and the predicted outcome was 0.28 (p=0.042), lower than the correlation between the predicted FEV1pp and observed using metabolites. 
+
+```{r Lasso Regression, message = FALSE, warning = FALSE}
+# Loading in the package
+library(glmnet)
+
+# Training the model, finding the best lambda value
+set.seed(1)
+
+# Save the outcome
+outcome <- clinical_data_soma$FEV1_percent_predicted
+
+# Full training data
+X <- somascan_normalized_clean_features_log_scale
+Y <- outcome
+
+# Fit the model
+lasso_cv <- cv.glmnet(X, Y, family = "gaussian", alpha = 1)
+lambda.min <- lasso_cv$lambda.min
+
+# Fit the model again on the test data with the min lambda
+lasso_final <- glmnet(X, Y, family = "gaussian", alpha = 1, lambda = lambda.min)
+
+# Which coefficients are non-zero?
+lasso_beta <- matrix(lasso_final$beta)
+rownames(lasso_beta) <- protein.names.tab.reorder$`Target Name`
+non_zero_betas <- lasso_beta[lasso_beta != 0, ]
+
+# Displaying the coefficients that were non-zero 
+non_zero_betas_tab <- data.frame(Protein = names(non_zero_betas),
+                                 Coefficient = non_zero_betas)
+non_zero_betas_tab <- non_zero_betas_tab[order(abs(non_zero_betas_tab$Coefficient), decreasing = TRUE),]
+
+kable(non_zero_betas_tab, format = "html", align = 'c',
+      caption = "Non-zero coefficients from running lasso regression on the full training data with FEV1pp as the outcome.") %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# Consider cross validation --
+case_control_labels <- ifelse(clinical_data_soma$ccstat == 1, 1, -1)
+ind_of_pairs <- seq(from = 1, to = length(case_control_labels), by = 2)
+
+cv.lasso <- lapply(ind_of_pairs, function(i) {
+  set.seed(i)
+  
+  # For each case-control pair, i
+  # find optimal penalty
+  cv.fit <- cv.glmnet(x = X[-c(i, i+1),],
+                   y = Y[-c(i, i+1)],
+                   family = "gaussian",
+                   alpha = 1)
+  
+  # save optimal penalty
+  lambda.min <- cv.fit$lambda.min
+  
+  # refit model with penalty
+  fit <- glmnet(x = X[-c(i, i+1),],
+                y = Y[-c(i, i+1)],
+                family = "gaussian", 
+                alpha = 1,
+                lambda = lambda.min)
+  # calculate scores on test pair
+  pred.out <- matrix(fit$a0 + X[c(i, i+1),] %*% fit$beta, ncol = 2)
+  names(pred.out) <- rownames(X[c(i, i+1),])
+  
+  # Saving the betas
+  list(pred.out = pred.out, beta.out = fit$beta)
+})
+
+# Saving the predicted outcome on the held-out pair
+cv.lasso.list <- c(sapply(cv.lasso, function(iter) iter$pred.out))
+
+# Saving the betas from each cross-validated run
+cv.beta.list <- sapply(cv.lasso, function(iter) t(iter$beta.out))
+cv.beta.matrix <- do.call(rbind, cv.beta.list)
+colnames(cv.beta.matrix) <- protein.names.tab.reorder$`Target Name`
+
+# Colmeans on the betas
+cv.average.beta <- colMeans(cv.beta.matrix)
+
+# Saving the proportion of times each protein had a non-zero value
+cv.prop.selected <- apply(cv.beta.matrix, 2, function(protein) sum(protein != 0)/length(protein))
+
+# Displaying the average weights of each protein across the cross validation iterations
+cv.beta.tab <- data.frame(Protein = character(n_proteins),
+                          UniProtID = character(n_proteins),
+                          Average.Beta = numeric(n_proteins),
+                          Prop.Selected = numeric(n_proteins))
+cv.beta.tab$Protein <- names(cv.average.beta)
+cv.beta.tab$UniProtID <- protein.names.tab.reorder$`UniProt ID`
+cv.beta.tab$Average.Beta <- cv.average.beta
+cv.beta.tab$Prop.Selected <- cv.prop.selected
+cv.beta.tab.reorder <- cv.beta.tab[order(abs(cv.beta.tab$Prop.Selected), decreasing = TRUE),]
+
+cv.beta.tab.reorder[cv.beta.tab.reorder$Prop.Selected > 0.5,] %>% kable(format = "html", align = 'c',
+      caption = "Average coefficients of proteins after lasso regression on the with cross validation with FEV1pp as the outcome. Coefficients were averaged across the cross validation iterations.") %>% kable_styling(full_width = F) %>% 
+  scroll_box(height = "500px")
+
+# Plotting the predicted outcome against the true outcome
+cor.test(outcome, cv.lasso.list)
+plot(outcome, cv.lasso.list, xlab = "True FEV1pp", ylab = "Predicted FEV1pp",
+     main = "FEV1pp Observed vs. Predicted Outcome from Lasso Regression with FEV1pp", pch = 16)
+abline(a = 0, b = 1)
+```
+
+### Permutation Testing with FEV1pp (Permute Within Pairs)
+
+We now compare the results from pathway analysis using proteins filtered based on significant correlation with FEV1pp to our results using proteins significantly different between cases and controls. We followed the same procedure to select proteins that we submitted for pathway analysis. We used the same permutation testing approach as above but instead of a paired t-test between permuted cases and controls, we considered a Pearson correlation test between each protein and the permuted FEV1pp. The specific steps were as follows: 
+
+\begin{itemize}
+  \item First, compute the Pearson correlation test p-values for the correlation between FEV1pp and each aptamer
+  \item Combine these p-values using Fisher's method, i.e. for each aptamer, obtain all $k$ aptamers that correspond to a single protein identifier and compute $-2\sum_{i=1}^k \log p_i$. It is possible that $k = 1$ if there is only one aptamer that maps to a protein. 
+  \item Then, for 10000 iterations:
+  \begin{itemize}
+    \item Randomly scramble the FEV1pp results _within each pair_
+    \item Compute a Pearson correlation test comparing each aptamer with the permuted FEV1pp values
+    \item Save the p-value
+  \end{itemize}
+  \item After 10000 iterations, we should have 10000 p-values for each aptamer
+  \item For each protein and each iteration, combine the p-values using Fisher's method again, i.e. for each protein, obtain all $k$ aptamers that correspond and compute $-2\sum_{i=1}^k \log p_i$. Should result in 10000 combined p-values for each protein 
+  \item Compare the original combined p-value to the combined permutation p-values by computing the permutation testing p-value for each protein, $p^{permute}_{\ell}$, $\ell = 1, \dpts, 4253$: $p^{permute}_{\ell} = \sum_{i=1}^{10000} \frac{\text{(# times permutation combined p-value > original combined p-value) + 1 }}{10000 + 1}$
+\end{itemize}
+
+As before, we used the UniProt ID to uniquely identify proteins. Protein target names were not necessarily unique and there were multiple versions of certain proteins corresponding to different post-transcriptional modifications that Chris said were not of interest in maintaining. 
+
+We found that 760 proteins were significant following permutation testing. This represents an increase from the 467 significant proteins when we did permutation testing using binary case-control status. As before, no proteins were significant after FDR adjustment. There were 434 proteins that were significant from both permutation testing schemes. 
+
+```{r Permutation Testing with FEV1pp, message = FALSE, warning = FALSE}
+# Loading in the permutation p-values when considering FEV1pp as the outcome
+load("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1pp_ORA/fev1pp_cor_test_combined_permutation_pvalues_10k.rda", verbose = TRUE)
+
+# FDR correction on the permutation p-values
+permutation_pvalues_corr_fdr <- p.adjust(permutation_pvalues_corr, method = "fdr")
+
+# Which were < 0.05? (Before FDR correction)
+significant_proteins_corr <- permutation_pvalues_corr[permutation_pvalues_corr < 0.05]
+
+# Display
+proteins_corr_tab <- data.frame(Protein = character(length(permutation_pvalues_corr)),
+                                UniProtID = names(permutation_pvalues_corr),
+                                PermutationPValue = permutation_pvalues_corr,
+                                QValue = permutation_pvalues_corr_fdr)
+
+# Add target names
+proteins_corr_tab$Protein <- protein.names.tab.reorder[match(proteins_corr_tab$UniProtID,
+                                                             protein.names.tab.reorder$`UniProt ID`),]$`Target Name`
+
+# Order permutation p-values
+proteins_corr_tab <- proteins_corr_tab[order(proteins_corr_tab$PermutationPValue, decreasing = FALSE),]
+rownames(proteins_corr_tab) <- NULL
+
+# Display
+proteins_corr_tab %>% kable(format = "html", align = "c",
+                            col.names = c("Protein", "UniProt ID", "Permutation P-Value", "Q-Value"),
+      caption = "Permutation testing p-values for correlation with FEV1pp after using Fisher's method to combine p-values across aptamers and their associated Q-value after FDR correction. These are signficant proteins prior to FDR adjustment when considering a correlation test between each protein and FEV1pp.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# Creating a histogram of the p-values
+hist(significant_proteins_corr, main = "Permutation Testing P-values from Correlation Testing", xlab = "P-Value",
+     breaks = 15)
+
+# How much overlap is there between the results from paired t-testing and correlation testing?
+sum(names(significant_proteins_corr) %in% names(significant_proteins))
+sum(names(significant_proteins) %in% names(significant_proteins_corr))
+```
+```{r Saving the Significant Proteins for Pathway Analysis (With FEV1pp), warning = FALSE, message = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Saving the proteins that were significant after permutation testing to 
+# enter into pathway analysis. 
+# -----------------------------------------------------------------------------
+
+# We don't need the proteins to be in a particular order or anything, we can just
+# submit the UniProt IDs.
+
+# Saving the UniProt IDs in a text file to upload
+UniProtID_PT_FEV1pp_file <- file(paste0(somascan_wd, "UniProtIDs_for_Significant_Proteins_Permutation_Testing10k_FEV1pp.txt"))
+writeLines(names(significant_proteins_corr), UniProtID_PT_FEV1pp_file)
+close(UniProtID_PT_FEV1pp_file)
+
+# There reference file is the same as before
+```
+
+### Permutation Testing and Pathway Analysis with FEV1pp (Permute Across Sample)
+
+We realized that it may not be correct to permute FEV1pp within case-control pairs because the pairs were not determined based on FEV1pp value. We came to this conclusion after realizing the results from permutation testing did not closely match the theoretical results, unlike with case-control status. We then considered permutation testing where we permute FEV1pp across the entire sample. The results are as follows:
+
+We found 1304 proteins that were significant prior to FDR adjustment at the FDR level. 581 proteins were significant at an FDR level of 0.05. 1288 out of the 1304 significant proteins were also significant using the theoretical framework, so that suggests there is good overlap. 
+
+```{r Permutation Testing with FEV1pp (Permute Across Sample), message = FALSE, warning = FALSE}
+# -----------------------------------------------------------------------------
+# Preparing the table with permutation testing results
+# -----------------------------------------------------------------------------
+
+# Loading in the permutation p-values when considering FEV1pp as the outcome
+load("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1pp_ORA/FEV1pp_cor_test_permutation_pvalues_permute_across_sample.rda", verbose = TRUE)
+
+# FDR correction on the permutation p-values
+permutation_pvalues_corr_fdr_permute_sample <- p.adjust(fev1pp_corr_with_proteins$permutation_pvalues, method = "fdr")
+
+# Display
+proteins_corr_tab_permute_sample <- data.frame(Protein =
+                                                 character(length(permutation_pvalues_corr_fdr_permute_sample)),
+                                               UniProtID = names(fev1pp_corr_with_proteins$permutation_pvalues),
+                                               PermutationPValue = fev1pp_corr_with_proteins$permutation_pvalues,
+                                               QValue = permutation_pvalues_corr_fdr_permute_sample)
+
+# Removing the rownames
+rownames(proteins_corr_tab_permute_sample) <- NULL
+
+# Fill in the protein target names
+proteins_corr_tab_permute_sample$Protein <- 
+  protein.names.tab.reorder[match(proteins_corr_tab_permute_sample$UniProtID,
+                                  protein.names.tab.reorder$`UniProt ID`),]$`Target Name`
+
+# Check
+all(protein.names.tab.reorder[match(proteins_corr_tab_permute_sample$UniProtID,
+                                  protein.names.tab.reorder$`UniProt ID`),]$`UniProt ID`
+    == proteins_corr_tab_permute_sample$UniProtID)
+
+# Order by Q-Value
+proteins_corr_tab_permute_sample <-
+  proteins_corr_tab_permute_sample[order(proteins_corr_tab_permute_sample$PermutationPValue, decreasing = FALSE),]
+
+# Display the table
+proteins_corr_tab_permute_sample %>% kable(format = "html", align = "c",
+                            col.names = c("Protein", "UniProt ID", "Permutation P-Value", "Q-Value"),
+      caption = "Permutation testing p-values for correlation with FEV1pp after using Fisher's method to combine p-values across aptamers and their associated Q-value after FDR correction. These are signficant proteins prior to FDR adjustment when considering a correlation test between each protein and FEV1pp. Permutations were done across the sample.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# How much overlap is there between the results from paired t-testing and correlation testing?
+# sum(fev1pp_corr_with_proteins$significant_proteins %in% cor.test.combined_tab$UniProtID[cor.test.combined_tab$P.value < 0.05])
+```
+```{r Saving Permutation Results for FEV1pp (Permute Across Sample) for Pathway Analysis}
+# -----------------------------------------------------------------------------
+# Save the results for pathway analysis
+# -----------------------------------------------------------------------------
+
+# Store the proteins significant at 0.05 level
+significant_proteins_corr_permute_sample <- fev1pp_corr_with_proteins$significant_proteins
+
+# Write to txt file
+UniProtID_file <- file(paste0(somascan_wd, "FEV1pp_ORA/UniProtIDs_for_Significant_Proteins_CorTest_FEV1pp_PermuteAcrossSample.txt"))
+writeLines(significant_proteins_corr_permute_sample, UniProtID_file)
+close(UniProtID_file)
+
+# Store proteins significant at FDR 0.05 level
+significant_proteins_corr_permute_sample_fdr <- names(permutation_pvalues_corr_fdr_permute_sample)[permutation_pvalues_corr_fdr_permute_sample < 0.05] 
+
+# Write to txt file
+UniProtID_file <- file(paste0(somascan_wd, "FEV1pp_ORA/UniProtIDs_for_Significant_Proteins_CorTest_FEV1pp_PermuteAcrossSample_FDR.txt"))
+writeLines(significant_proteins_corr_permute_sample_fdr, UniProtID_file)
+close(UniProtID_file)
+```
+
+We consider the top three most significant proteins and plot their relationship with FEV1pp to visually assess their relationship with the outcome. This is a simple test to see if we would expect these proteins to have a strong relationship with FEV1pp and to check our work. 
+
+```{r Scatterplot of Top Proteins and FEV1pp}
+# Saving the top significant proteins
+top_sig_fev1pp <- names(sort(fev1pp_corr_with_proteins$permutation_pvalues, decreasing = FALSE))[1:3]
+
+# Obtaining the corresponding SeqIDs
+top_sig_fev1pp_seqids <- protein.names.tab.reorder %>% 
+  filter(`UniProt ID` %in% top_sig_fev1pp) 
+
+par(mfrow = c(2,2))
+# Subsetting the Somascan data for each protein
+for (i in 1:nrow(top_sig_fev1pp_seqids)) {
+  # Saving the current SeqID
+  current_seqid <- top_sig_fev1pp_seqids$SeqID[i]
+  
+  # Select current protein
+  current_protein <- somascan_normalized_clean_features_log_scale[,current_seqid]
+  
+  # Convert SeqID to its protein name
+  current_target <- top_sig_fev1pp_seqids$`Target Name`[i]
+  
+  # Plot against FEV1pp
+  plot(clinical_data_soma$FEV1_percent_predicted, current_protein,
+       xlab = "FEV1pp", ylab = current_target, main = paste0("FEV1pp vs. ", current_target))
+}
+par(mfrow = c(1,1))
+```
+
+### Pathway Analysis Using FEV1pp (Permute Within Pair)
+
+The results from pathway analysis are shown here. 2991 pathways were found, where 623 out of 760 input gene identifiers were mapped to 630 distinct proteins found in these pathways. The background gene size was detected to be 3072. The top pathway identified here, neutrophil degranulation, was also the top pathway identified when we considered binary case-control status as the outcome. However, this pathway is more significant in this analysis than it was in the case-control status analysis, with a q-value (as per Impala) of 0.00392 compared to 0.217. This appears to be the pathway with the most confidence. After that, the results from both pathway analyses overlap only in apoptosis in homo sapiens and metalloprotease DUBs. The top pathways are more significant here, with 2 pathways having q-values below the 0.2 level. In the other pathway analysis, no pathways were significant at the 0.2 level after FDR correction. 
+
+```{r Pathway Analysis Results with FEV1pp, warning = FALSE, message = FALSE}
+# Load in the results from Impala
+pathway_analysis_res_fev1pp <- read.csv("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1pp_ORA/Somascan_Pathway_Analysis_Results_With_Reference_Using_UniProt_FEV1pp.csv")
+
+# Remove the "Overlapping Genes" column
+pathway_analysis_res_fev1pp_no_overlapping <- pathway_analysis_res_fev1pp %>%  dplyr::select(-overlapping_genes)
+
+# Add an FDR correction
+# pathway_analysis_res_fev1pp_no_overlapping$FDR <- p.adjust(pathway_analysis_res_fev1pp_no_overlapping$P_genes, method = "fdr")
+
+# How many were significant?
+sum(pathway_analysis_res_fev1pp_no_overlapping$Q_genes < 0.2)
+sum(pathway_analysis_res_fev1pp_no_overlapping$FDR < 0.2)
+
+# Display the results
+pathway_analysis_res_fev1pp_no_overlapping %>% kable(format = "html", align = "c",
+      caption = "Top pathways from pathway analysis using proteins significant after permutation testing with FEV1pp.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+At this point, we've gotten validation that neutrophil degranulation is an important pathway in COPD. This makes sense because we used the same permutation scheme as in the case-control pairs and FEV1pp loosely correlates with who is a case and who is a control. Here, we investigate the proteins that are included in this pathway. 
+
+```{r Neutrophil Degranulation Pathway, warning = FALSE, message = FALSE}
+# Saving the proteins identified in the Neutrophil Degranulation pathway
+neutrophil_proteins <- pathway_analysis_res_fev1pp$overlapping_genes[1]
+
+# Separate the proteins at the ;
+neutrophil_proteins <- strsplit(neutrophil_proteins, split = ";")[[1]]
+
+# Checking the number matches how many there should be
+length(neutrophil_proteins) == pathway_analysis_res_fev1pp$num_overlapping_genes[1]
+
+# One of the proteins is duplicated - remove it here 
+neutrophil_proteins[duplicated(neutrophil_proteins)]
+neutrophil_proteins <- neutrophil_proteins[!duplicated(neutrophil_proteins)]
+
+# Create a dataframe with the information 
+neutrophil_proteins_tab <- data.frame(SeqID = character(length(neutrophil_proteins)),
+                                      Protein = character(length(neutrophil_proteins)),
+                                      UniProt = neutrophil_proteins,
+                                      `Avg Exp Cases` = numeric(length(neutrophil_proteins)),
+                                      `Avg Exp Controls` = numeric(length(neutrophil_proteins)),
+                                      `Corr with FEV1pp` = numeric(length(neutrophil_proteins)),
+                                      `CorrQValue` = numeric(length(neutrophil_proteins)),
+                                      `TTest Stat` = numeric(length(neutrophil_proteins)),
+                                      `TTestQValue` = numeric(length(neutrophil_proteins)))
+
+# Fill in the table
+neutrophil_proteins_tab$SeqID <- protein.names.tab.reorder %>%
+  dplyr::slice(match(neutrophil_proteins_tab$UniProt, `UniProt ID`)) %>% 
+  dplyr::select(`SeqID`) %>% unlist
+
+neutrophil_proteins_tab$Protein <- protein.names.tab.reorder %>%
+  dplyr::slice(match(neutrophil_proteins_tab$UniProt, `UniProt ID`)) %>% 
+  dplyr::select(`Target Name`) %>% unlist
+
+neutrophil_proteins_tab$Avg.Exp.Cases <-
+  somascan_normalized_clean_features[clinical_data_soma$ccstat==1, unlist(neutrophil_proteins_tab$SeqID)] %>% colMeans
+  
+neutrophil_proteins_tab$Avg.Exp.Controls <-
+  somascan_normalized_clean_features[clinical_data_soma$ccstat==2, unlist(neutrophil_proteins_tab$SeqID)] %>% colMeans
+
+neutrophil_proteins_tab$Corr.with.FEV1pp <- corr_fev1pp_proteins %>%
+  dplyr::slice(match(neutrophil_proteins_tab$UniProt, UniProtID)) %>% 
+  dplyr::select(Correlation) %>% unlist
+
+neutrophil_proteins_tab$CorrQValue <- corr_fev1pp_proteins %>%
+  dplyr::slice(match(neutrophil_proteins_tab$UniProt, UniProtID)) %>% 
+  dplyr::select(Q.Value) %>% unlist
+
+neutrophil_proteins_tab$TTest.Stat <- t.test_tab %>% 
+  dplyr::slice(match(neutrophil_proteins_tab$UniProt, UniProtID)) %>% 
+  dplyr::select(Test.Stat) %>% unlist
+
+neutrophil_proteins_tab$TTestQValue <- t.test_tab %>% 
+  dplyr::slice(match(neutrophil_proteins_tab$UniProt, UniProtID)) %>% 
+  dplyr::select(Q.value) %>% unlist
+
+# Order from most significant to least
+neutrophil_proteins_tab <- neutrophil_proteins_tab[order(neutrophil_proteins_tab$CorrQValue, decreasing = FALSE),]
+
+# Displaying the table
+neutrophil_proteins_tab %>% kable(format = "html", align = "c",
+      caption = "Proteins that were significant in both paired t-testing and correlation testing that overlapped with the Neutrophil Degranulation pathway.",
+      col.names = c("SeqID", "Protein", "UniProt ID", "Avg Expression (Cases)",
+                    "Avg Expression (Controls)", "Correlation", "Correlation Q-Value",
+                    "T-Test Stat", "T-Test Q-Value")) %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+``` 
+
+### Pathway Analysis Using FEV1pp (Permute Across Sample)
+
+When we considered permuting across the entire sample rather than within each case-control pair, we obtained the following pathway analysis results. We considered filtering proteins that were significant at the 0.05 level and proteins that were significant at an FDR level of 0.05. 
+
+```{r ORA Results with FEV1pp (Permute Across Sample, Sig at Unadjusted Level), warning = FALSE, message = FALSE}
+# -----------------------------------------------------------------------------
+# Loading in the .CSV ORA results and display
+# -----------------------------------------------------------------------------
+
+# Read in file
+ora_fev1pp_permute_sample <- read.csv("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1pp_ORA/ORA_FEV1pp_CorTest_PermuteSample.csv")
+
+# Remove large columns
+ora_fev1pp_permute_sample <- ora_fev1pp_permute_sample %>% dplyr::select(-overlapping_genes)
+
+# Display 
+ora_fev1pp_permute_sample %>% kable(format = "html", align = "c",
+      caption = "Top pathways after doing permutation testing considering FEV1pp as an outcome and permuting across the entire sample. Significant proteins were significant at an unadjusted 0.05 level.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+```{r ORA Results with FEV1pp (Permute Across Sample, Sig at FDR Level), warning = FALSE, message = FALSE, include = FALSE}
+# -----------------------------------------------------------------------------
+# Loading in the .CSV ORA results and display
+# -----------------------------------------------------------------------------
+
+# Read in file
+ora_fev1pp_permute_sample_fdr <- read.csv("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1pp_ORA/ORA_FEV1pp_CorTest_PermuteSample_FDR.csv")
+
+# Remove large columns
+ora_fev1pp_permute_sample_fdr <- ora_fev1pp_permute_sample_fdr %>% dplyr::select(-overlapping_genes)
+
+# Display 
+ora_fev1pp_permute_sample_fdr %>% kable(format = "html", align = "c",
+      caption = "Top pathways after doing permutation testing considering FEV1pp as an outcome and permuting across the entire sample. Significant proteins were significant at an FDR-adjusted 0.05 level.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Considering FEV1/FVC as an Outcome {.panel-title}
+## {.panel-body}
+
+In this section, we consider permutation testing with FEV1/FVC as the outcome. Note that we do not use FEV1/FVC-percent-predicted but instead use the raw ratio unadjusted. This is a measure of airway obstruction. I checked that the `fev1fvc` column is indeed a ratio of the FEV1 column and the FVC column.  
+
+```{r Correlation with FEV1FVC, warning = FALSE, message = FALSE}
+# -----------------------------------------------------------------------------
+# Correlations between proteins and FEV1/FVC
+# -----------------------------------------------------------------------------
+
+# First, checking the order still matches between the clinical and protein data --
+all(somascan_normalized_clean$PID == clinical_data_soma$id)
+
+# Computing the correlations between each metabolite (each row in the lavage data)
+# with FEV1_percent_predicted
+corr_fev1fvc_proteins <- data.frame(SeqID = character(n_proteins),
+                                   Protein = character(n_proteins),
+                                   UniProtID = character(n_proteins),
+                                   Correlation = numeric(n_proteins),
+                                   Test.Stat = numeric(n_proteins),
+                                   P.Value = numeric(n_proteins),
+                                   Q.Value = numeric(n_proteins))
+
+for (i in 1:n_proteins) {
+  # Save the current protein data
+  seqID_i <- aptamers[i]
+  protein_i <- protein.names.tab.reorder$`Target Name`[i]
+  uniprot_i <- protein.names.tab.reorder$`UniProt ID`[i]
+    
+  # Calculate correlation
+  corr_i <- cor.test(somascan_normalized_clean_features_log_scale[,i], 
+                     clinical_data_soma$fev1fvc)
+  
+  # Save results
+  corr_fev1fvc_proteins$SeqID[i] <- seqID_i
+  corr_fev1fvc_proteins$Protein[i] <- protein_i
+  corr_fev1fvc_proteins$UniProtID[i] <- uniprot_i
+  corr_fev1fvc_proteins$Correlation[i] <- corr_i$estimate
+  corr_fev1fvc_proteins$Test.Stat[i] <- corr_i$statistic
+  corr_fev1fvc_proteins$P.Value[i] <- corr_i$p.value
+}
+
+# Applying an FDR correction
+corr_fev1fvc_proteins$Q.Value <- p.adjust(corr_fev1fvc_proteins$P.Value, method = "fdr")
+
+# Sorting the rows in order of Q-value
+corr_fev1fvc_proteins_reorder <- corr_fev1fvc_proteins
+corr_fev1fvc_proteins_reorder <- corr_fev1fvc_proteins_reorder[order(corr_fev1fvc_proteins_reorder$Q.Value, decreasing = FALSE),]
+
+# Adding indices for the rows
+rownames(corr_fev1fvc_proteins_reorder) <- 1:n_proteins
+
+# How many were below each threshold?
+sum(corr_fev1fvc_proteins_reorder$Q.Value < 0.05)
+sum(corr_fev1fvc_proteins_reorder$Q.Value < 0.1)
+sum(corr_fev1fvc_proteins_reorder$Q.Value < 0.2)
+
+# Table:
+# Creating the table to be a scroll box
+kable(corr_fev1fvc_proteins_reorder, format = "html", align = 'c',
+      caption = "Correlation between proteins and FEV1/FVC. P-values were adjusted for multiple testing using an FDR correction.") %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# Saving the p-values from the correlation tests on the original data
+corr.fev1fvc.p.values <- corr_fev1fvc_proteins$P.Value
+names(corr.fev1fvc.p.values) <- corr_fev1fvc_proteins$SeqID
+corr.fev1fvc.p.values.names <- corr.fev1fvc.p.values # corr.p.values, I accidentally used this one (which was for FEV1pp)
+names(corr.fev1fvc.p.values.names) <- corr_fev1fvc_proteins$UniProtID
+save(corr.fev1fvc.p.values, corr.fev1fvc.p.values.names, file = "/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1FVC/PValuesCorrFEV1FVCUncombined.rda")
+```
+
+We consider permutation testing using the above p-values. The results were as follows:
+
+```{r Permutation Testing with FEV1FVC, warning = FALSE, message = FALSE}
+# Loading in the permutation p-values when considering FEV1/FVC as the outcome
+load("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1FVC/FEV1FVC_combined_permutation_pvalues_10k_permute_across_sample.rda", verbose = TRUE)
+
+# FDR correction on the permutation p-values
+permutation_pvalues_fev1fvc_fdr <- p.adjust(fev1fvc_corr_with_proteins$permutation_pvalues, method = "fdr")
+
+# Which were < 0.05? (Before FDR correction)
+significant_proteins_fev1fvc <- fev1fvc_corr_with_proteins$permutation_pvalues[fev1fvc_corr_with_proteins$permutation_pvalues < 0.05]
+
+# Display
+proteins_fev1fvc_tab <- data.frame(Protein =
+                                    character(length(fev1fvc_corr_with_proteins$permutation_pvalues)),
+                                    UniProtID = names(fev1fvc_corr_with_proteins$permutation_pvalues),
+                                    PermutationPValue = fev1fvc_corr_with_proteins$permutation_pvalues,
+                                    QValue = fev1fvc_corr_with_proteins$permutation_pvalues)
+
+# Add target names
+proteins_fev1fvc_tab$Protein <- protein.names.tab.reorder[match(proteins_fev1fvc_tab$UniProtID,
+                                                             protein.names.tab.reorder$`UniProt ID`),]$`Target Name`
+
+# Order permutation p-values
+proteins_fev1fvc_tab <- proteins_fev1fvc_tab[order(proteins_fev1fvc_tab$PermutationPValue, decreasing = FALSE),]
+rownames(proteins_fev1fvc_tab) <- NULL
+
+# Display
+proteins_fev1fvc_tab %>% kable(format = "html", align = "c",
+                            col.names = c("Protein", "UniProt ID", "Permutation P-Value", "Q-Value"),
+      caption = "Permutation testing p-values for correlation with FEV1/FVC after using Fisher's method to combine p-values across aptamers and their associated Q-value after FDR correction. These are signficant proteins prior to FDR adjustment when considering a correlation test between each protein and FEV1pp.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# Creating a histogram of the p-values
+hist(fev1fvc_corr_with_proteins$permutation_pvalues, main = "Permutation Testing P-values from Correlation Testing with FEV1/FVC", xlab = "P-Value",
+     breaks = 15)
+```
+```{r Saving the Significant Proteins for Pathway Analysis (With FEV1FVC), warning = FALSE, message = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Saving the proteins that were significant after permutation testing to 
+# enter into pathway analysis. 
+# -----------------------------------------------------------------------------
+
+# We don't need the proteins to be in a particular order or anything, we can just
+# submit the UniProt IDs.
+
+# Saving the UniProt IDs in a text file to upload
+UniProtID_PT_FEV1FVC_file <- file(paste0(somascan_wd, "FEV1FVC/UniProtIDs_for_Significant_Proteins_Permutation_Testing10k_FEV1FVC.txt"))
+writeLines(fev1fvc_corr_with_proteins$significant_proteins, UniProtID_PT_FEV1FVC_file)
+close(UniProtID_PT_FEV1FVC_file)
+
+# There reference file is the same as before
+
+# -----------------------------------------------------------------------------
+# Saving the proteins that were significant at the FDR level of 0.05
+# -----------------------------------------------------------------------------
+
+# Saving the list of proteins that were significant at FDR level of 0.05
+significant_proteins_fev1fvc_fdr <- names(permutation_pvalues_fev1fvc_fdr)[permutation_pvalues_fev1fvc_fdr < 0.05]
+
+# Saving the UniProt IDs in a text file to upload
+UniProtID_PT_FEV1FVC_file <- file(paste0(somascan_wd, "FEV1FVC/UniProtIDs_for_Significant_Proteins_Permutation_Testing10k_FEV1FVC_FDR.txt"))
+writeLines(significant_proteins_fev1fvc_fdr, UniProtID_PT_FEV1FVC_file)
+close(UniProtID_PT_FEV1FVC_file)
+```
+
+We display scatterplots of the top proteins vs. FEV1/FVC to check if the top proteins appear to be highly associated with FEV1/FVC. 
+
+```{r Scatterplot of Top Proteins and FEV1/FVC}
+# Saving the top significant proteins
+top_sig_fev1fvc <- names(sort(fev1fvc_corr_with_proteins$permutation_pvalues, decreasing = FALSE))[1:3]
+
+# Obtaining the corresponding SeqIDs
+top_sig_fev1fvc_seqids <- protein.names.tab.reorder %>% 
+  filter(`UniProt ID` %in% top_sig_fev1fvc) 
+
+par(mfrow = c(2,2))
+# Subsetting the Somascan data for each protein
+for (i in 1:nrow(top_sig_fev1fvc_seqids)) {
+  # Saving the current SeqID
+  current_seqid <- top_sig_fev1fvc_seqids$SeqID[i]
+  
+  # Select current protein
+  current_protein <- somascan_normalized_clean_features_log_scale[,current_seqid]
+  
+  # Convert SeqID to its protein name
+  current_target <- top_sig_fev1fvc_seqids$`Target Name`[i]
+  
+  # Plot against FEV1/FVC
+  plot(clinical_data_soma$fev1fvc, current_protein,
+       xlab = "FEV1/FVC", ylab = current_target, main = paste0("FEV1/FVC vs. ", current_target))
+}
+par(mfrow = c(1,1))
+```
+
+Displaying the results from pathway analysis with the proteins that were significant following permutation testing with FEV1/FVC:
+
+```{r Pathway Analysis with Proteins Significantly Correlated with FEV1FVC, warning = FALSE, message = FALSE}
+# Loading in the results
+ora_fev1fvc <- read.csv(paste0(somascan_wd, "FEV1FVC/ORA_FEV1FVC_Permutation_10k_UnadjustedPvalue_April6th.csv"))
+
+# Remove the overlapping genes column
+ora_fev1fvc <- ora_fev1fvc %>% dplyr::select(-overlapping_genes)
+
+# Display
+ora_fev1fvc %>% kable(format = "html", align = "c",
+      caption = "Overrepresentation analysis results when considering correlation with FEV1/FVC and permuting across the entire sample set.", col.names = c("Pathway", "Source", "# Overlapping Genes", "# All Pathway Genes", "P-Value", "Q-Value")) %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+Below are the pathway analysis results for proteins significant at an FDR threshold of 0.05. 1180 out of 1467 proteins (the number of proteins that were significant at FDR < 0.05) were mapped to 1189 entities. The number of reference proteins was 3872 but the background gene size was 3072.  
+
+```{r Pathway Analysis with Proteins Significantly Correlated with FEV1FVC (FDR), warning = FALSE, message = FALSE}
+# Loading in the results
+ora_fev1fvc_fdr <- read.csv(paste0(somascan_wd, "FEV1FVC/ORA_FEV1FVC_Permutation_10k_FDR_April12.csv"))
+
+# Remove the overlapping genes column
+ora_fev1fvc_fdr <- ora_fev1fvc_fdr %>% dplyr::select(-overlapping_genes)
+
+# Display
+ora_fev1fvc_fdr %>% kable(format = "html", align = "c",
+      caption = "Overrepresentation analysis results when considering correlation with FEV1/FVC and permuting across the entire sample set. Significant proteins were those that were significant at an FDR threshold of 0.05.", col.names = c("Pathway", "Source", "# Overlapping Genes", "# All Pathway Genes", "P-Value", "Q-Value")) %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+```
+
+We then consider the amount of overlap in proteins that were significantly correlated with FEV1pp and those that were significantly correlated with FEV1/FVC. Both permutation testing approaches were done by permuting across the entire sample. 1304 proteins were significantly correlated with FEV1pp at the 0.05 level while 1896 were significantly correlated with FEV1/FVC. 95\% (1248/1304) of the proteins significantly correlated with FEV1pp were also significantly correlated with FEV1/FVC. Recall that there are 3872 unique proteins overall. 
+
+```{r Proteins Correlated with FEV1pp and FEV1FVC, warning = FALSE, message = FALSE}
+# -----------------------------------------------------------------------------
+# Checking the overlap in significant proteins between FEV1pp and FEV1/FVC
+# -----------------------------------------------------------------------------
+
+# Loading in the permutation p-values when considering FEV1pp as the outcome
+load("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1pp_ORA/FEV1pp_cor_test_permutation_pvalues_permute_across_sample.rda", verbose = TRUE)
+
+# Loading in the permutation p-values when considering FEV1/FVC as the outcome
+load("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/FEV1FVC/FEV1FVC_combined_permutation_pvalues_10k_permute_across_sample.rda", verbose = TRUE)
+
+# Saving the significant proteins from both approaches
+significant_proteins_fev1pp <- fev1pp_corr_with_proteins$significant_proteins
+significant_proteins_fev1fvc <- fev1fvc_corr_with_proteins$significant_proteins
+
+# Check overlap
+sum(significant_proteins_fev1pp %in% significant_proteins_fev1fvc)
+length(significant_proteins_fev1pp)
+length(significant_proteins_fev1fvc)
+overlapping_proteins <- significant_proteins_fev1pp[significant_proteins_fev1pp %in% significant_proteins_fev1fvc]
+```
+
+We also considered performing lasso regression with cross validation with FEV1/FVC as the outcome. 
+
+```{r Lasso Regression with FEV1FVC, message = FALSE, warning = FALSE}
+# Loading in the package
+library(glmnet)
+
+# Training the model, finding the best lambda value
+set.seed(1)
+
+# Save the outcome
+fev1fvc <- clinical_data_soma$fev1fvc
+
+# Full training data
+X <- somascan_normalized_clean_features_log_scale
+
+# Fit the model
+lasso_cv_fev1fvc <- cv.glmnet(X, fev1fvc, family = "gaussian", alpha = 1)
+lambda.min <- lasso_cv_fev1fvc$lambda.min
+
+# Fit the model again on the test data with the min lambda
+lasso_final_fev1fvc <- glmnet(X, fev1fvc, family = "gaussian", alpha = 1, lambda = lambda.min)
+
+# Which coefficients are non-zero?
+lasso_beta_fev1fvc <- matrix(lasso_final_fev1fvc$beta)
+rownames(lasso_beta_fev1fvc) <- protein.names.tab.reorder$`Target Name`
+non_zero_betas_fev1fvc <- lasso_beta_fev1fvc[lasso_beta_fev1fvc != 0, ]
+
+# Displaying the coefficients that were non-zero 
+non_zero_betas_tab <- data.frame(Protein = names(non_zero_betas_fev1fvc),
+                                 Coefficient = non_zero_betas_fev1fvc)
+non_zero_betas_tab <- non_zero_betas_tab[order(abs(non_zero_betas_tab$Coefficient), decreasing = TRUE),]
+
+kable(non_zero_betas_tab, format = "html", align = 'c',
+      caption = "Non-zero coefficients from running lasso regression on the full training data with FEV1/FVC as the outcome. .") %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# -----------------------------------------------------------------------------
+# Consider cross validation 
+# -----------------------------------------------------------------------------
+
+case_control_labels <- ifelse(clinical_data_soma$ccstat == 1, 1, -1)
+ind_of_pairs <- seq(from = 1, to = length(case_control_labels), by = 2)
+
+cv.lasso <- lapply(ind_of_pairs, function(i) {
+  set.seed(i)
+  
+  # For each case-control pair, i
+  # find optimal penalty
+  cv.fit <- cv.glmnet(x = X[-c(i, i+1),],
+                   y = fev1fvc[-c(i, i+1)],
+                   family = "gaussian",
+                   alpha = 1)
+  
+  # save optimal penalty
+  lambda.min <- cv.fit$lambda.min
+  
+  # refit model with penalty
+  fit <- glmnet(x = X[-c(i, i+1),],
+                y = fev1fvc[-c(i, i+1)],
+                family = "gaussian", 
+                alpha = 1,
+                lambda = lambda.min)
+  # calculate scores on test pair
+  pred.out <- matrix(fit$a0 + X[c(i, i+1),] %*% fit$beta, ncol = 2)
+  names(pred.out) <- rownames(X[c(i, i+1),])
+  
+  # Saving the betas
+  list(pred.out = pred.out, beta.out = fit$beta)
+})
+
+# Saving the predicted outcome on the held-out pair
+cv.lasso.list <- c(sapply(cv.lasso, function(iter) iter$pred.out))
+
+# Saving the betas from each cross-validated run
+cv.beta.list <- sapply(cv.lasso, function(iter) t(iter$beta.out))
+cv.beta.matrix <- do.call(rbind, cv.beta.list)
+colnames(cv.beta.matrix) <- protein.names.tab.reorder$`Target Name`
+
+# Colmeans on the betas
+cv.average.beta <- colMeans(cv.beta.matrix)
+
+# Saving the proportion of times each protein had a non-zero value
+cv.prop.selected <- apply(cv.beta.matrix, 2, function(protein) sum(protein != 0)/length(protein))
+
+# Displaying the average weights of each protein across the cross validation iterations
+cv.beta.tab <- data.frame(Protein = character(n_proteins),
+                          UniProtID = character(n_proteins),
+                          Average.Beta = numeric(n_proteins),
+                          Prop.Selected = numeric(n_proteins))
+cv.beta.tab$Protein <- names(cv.average.beta)
+cv.beta.tab$UniProtID <- protein.names.tab.reorder$`UniProt ID`
+cv.beta.tab$Average.Beta <- cv.average.beta
+cv.beta.tab$Prop.Selected <- cv.prop.selected
+cv.beta.tab.reorder <- cv.beta.tab[order(abs(cv.beta.tab$Prop.Selected), decreasing = TRUE),]
+
+cv.beta.tab.reorder[cv.beta.tab.reorder$Prop.Selected > 0.5,] %>% kable(format = "html", align = 'c',
+      caption = "Average coefficients of proteins after lasso regression on the with cross validation with FEV1/FVC as the outcome. Coefficients were averaged across the cross validation iterations.") %>% kable_styling(full_width = F) %>% 
+  scroll_box(height = "500px")
+
+cor.test(fev1fvc, cv.lasso.list)
+
+# Plotting the predicted outcome against the true outcome 
+
+# Without ID labels
+plot(fev1fvc, cv.lasso.list, xlab = "True FEV1/FVC", ylab = "Predicted FEV1/FVC",
+     main = "Observed vs. Predicted Outcome from Lasso Regression with FEV1/FVC", pch = 16)
+abline(a = 0, b = 1)
+
+# With ID labels
+plot(fev1fvc, cv.lasso.list, xlab = "True FEV1/FVC", ylab = "Predicted FEV1/FVC",
+     main = "Observed vs. Predicted Outcome from Lasso Regression with FEV1/FVC", pch = 16)
+text(fev1fvc, cv.lasso.list, labels = rownames(X))
+abline(a = 0, b = 1)
+
+```
+
+V\_53 is an outlier in the above cross validated lasso plot. Who is this patient? This patient was male, 69 years old, identified as black, not a smoker, on ART, had an FEV1/FVC level of 0.5099, and FEV1pp of 55.707. This individual belonged to the stand-out cluster we determine later. 
+
+```{r Investigating Outlier}
+# Saving the ID of interest
+outlier_id <- "V_53"
+
+# Investigating the clinical data
+clinical_data_soma %>% filter(id == outlier_id)
+```
+
+### Heatmaps
+
+We now create heatmaps displaying the expression levels of each protein across subjects. We order the subjects by their FEV1pp value, from lowest to highest (left to right). We order the proteins according to their correlation with FEV1pp (from highest to lowest, top to bottom). The heatmap shows that subjects who have the lowest FEV1pp have the highest expression across the proteins. As FEV1pp increases, expression levels tend to be less strong. The maximum positive correlation between any protein and FEV1pp was 0.586 and the maximum negative correlation was -0.634. The solid black line bisecting the heatmap separates the cases (on the left) from the controls (on the right). 
+
+```{r Functions for Heatmap, message = FALSE, warning = FALSE}
+library(gplots)
+bluered <- function(n){colorpanel(n, "blue", "white", "red")}
+
+show.image = function(Image,ylab=''){
+  lower = mean(Image,na.rm=TRUE)-3*sd(Image,na.rm=TRUE)
+  upper = mean(Image,na.rm=TRUE)+3*sd(Image,na.rm=TRUE)
+  Image[Image<lower] = lower
+  Image[Image>upper] = upper
+  my.image(x=1:dim(Image)[2], y=1:dim(Image)[1], z=t(Image), zlim = c(lower,upper),axes=FALSE,col=bluered(100),xlab="",ylab=ylab,na.color='black',outside.color='black')
+} 
+
+my.image <- function(x,y,z,  zlim, col, na.color='gray', outside.color='white', ...)
+{
+  figData=list() 
+  figData$z = z
+  newz.na <- zlim[2]+(zlim[2]-zlim[1])/length(col) # new z for NA
+  newz.outside <- zlim[2]+2*(zlim[2]-zlim[1])/length(col) # new z for values outside zlim
+  
+  figData$z[which(is.na(figData$z>zlim[2]))] <- newz.na # we affect newz.outside
+  figData$z[which(figData$z<zlim[1] | figData$z>zlim[2])] <- newz.outside # same for newz.na
+  
+  
+  zlim[2] <- zlim[2]+2*(zlim[2]-zlim[1])/length(col) # we finally extend the z limits to include the two new values 
+  
+  col <- c(col, na.color, outside.color) # we construct the new color range by including: na.color and outside.color
+  
+  image(x,y,figData$z,  zlim=zlim, col=col, ...) # we finally call image(...)
+}
+```
+```{r Heatmap for all Proteins, warning = FALSE, message = FALSE}
+# Ordering the proteins according to correlation with FEV1pp
+protein_order <- order(corr_fev1pp_proteins$Correlation, decreasing = TRUE) # High positive to high negative
+
+# Ordering subjects by their FEV1pp value
+subject_order <- order(clinical_data_soma$FEV1_percent_predicted, decreasing = FALSE) # Low to high
+
+# Creating a matrix for the heatmap
+soma_matrix <- t(as.matrix(somascan_normalized_clean_features_log_scale[subject_order, protein_order]))
+
+# Heatmap where subjects are ordered by FEV1pp
+par(mar=c(5,5,5,5))
+show.image(soma_matrix)
+title(main = "Protein Expression \n Observations Ordered by FEV1-Percent-Predicted", 
+      xlab = "Subjects", ylab = "Proteins", line = 1)
+mtext("Low FEV1pp", side=1, line=0, at=10)
+mtext("High FEV1pp", side=1, line=0, at=44)
+mtext("Negative \n Correlation", side=4, line=1, at=500)
+mtext("Positive \n Correlation", side=4, line=1, at=3700)
+par(mar = c(1,1,1,1))
+
+# Create a new heatmap with subjects ordered by FEV1/FVC value
+# Ordering subjects by their FEV1pp value
+subject_order_fev1fvc <- order(clinical_data_soma$fev1fvc, decreasing = FALSE) # Low to high
+
+# Creating a matrix for the heatmap
+soma_matrix_fev1fvc <- t(as.matrix(somascan_normalized_clean_features_log_scale[subject_order_fev1fvc, protein_order]))
+
+# Heatmap where subjects are ordered by FEV1pp
+par(mar=c(5,5,5,5))
+show.image(soma_matrix_fev1fvc)
+title(main = "Protein Expression \n Observations Ordered by FEV1/FVC", 
+      xlab = "Subjects", ylab = "Proteins", line = 1)
+mtext("Low FEV1/FVC", side=1, line=0, at=10)
+mtext("High FEV1/FVC", side=1, line=0, at=44)
+mtext("Negative \n Correlation", side=4, line=1, at=500)
+mtext("Positive \n Correlation", side=4, line=1, at=3700)
+par(mar = c(1,1,1,1))
+```
+```{r Heatmap for Neutrophil Degranulation Proteins, warning = FALSE, message = FALSE}
+# Converting the UniProt IDs back to SeqIDs
+protein.names.tab.reorder.nd <- protein.names.tab.reorder %>% 
+  filter(`UniProt ID` %in% neutrophil_proteins)
+
+protein.names.tab.reorder.nd <- protein.names.tab.reorder.nd[!(duplicated(protein.names.tab.reorder.nd$`UniProt ID`)),]
+
+neutrophil_proteins_seqid <- 
+  protein.names.tab.reorder.nd[match(neutrophil_proteins, protein.names.tab.reorder.nd$`UniProt ID`),] %>%
+  dplyr::select(SeqID) %>% unlist
+
+# Select just columns in the data that corresponding to the above proteins (nd = neutrophil degranulation)
+somascan_normalized_clean_features_log_scale_nd <- somascan_normalized_clean_features_log_scale[,neutrophil_proteins_seqid]
+
+# all(colnames(somascan_normalized_clean_features_log_scale_nd) == neutrophil_proteins_seqid) TRUE!
+
+# Ordering the proteins according to correlation with FEV1pp
+corr_fev1pp_proteins_nd <- corr_fev1pp_proteins %>% filter(UniProtID %in% neutrophil_proteins) %>%
+  group_by(UniProtID) %>% filter(Q.Value == min(Q.Value))
+
+corr_fev1pp_proteins_nd <- 
+  corr_fev1pp_proteins_nd[match(neutrophil_proteins, corr_fev1pp_proteins_nd$UniProtID), ]
+protein_order_nd <- order(corr_fev1pp_proteins_nd$Correlation, decreasing = TRUE) # High positive to high negative
+
+# Ordering subjects by their FEV1pp value
+subject_order <- order(clinical_data_soma$FEV1_percent_predicted, decreasing = FALSE) # Low to high
+
+# Creating a matrix for the heatmap
+soma_matrix_nd <- t(as.matrix(somascan_normalized_clean_features_log_scale_nd[subject_order, protein_order_nd]))
+
+# The heatmap
+par(mar=c(5,5,5,5))
+show.image(soma_matrix_nd)
+title(main = "Protein Expression in Neutrophil Degranulation Pathway", xlab = "Subjects", ylab = "Proteins", line = 1)
+mtext("Low FEV1pp", side=1, line=0, at=10)
+mtext("High FEV1pp", side=1, line=0, at=44)
+mtext("Negative \n Correlation", side=4, line=2, at=10)
+mtext("Positive \n Correlation", side=4, line=2, at=90)
+abline(v=26.5)
+par(mar = c(1,1,1,1))
+```
+```{r Heatmap for Significant Proteins with FEV1pp, warning = FALSE, message = FALSE}
+# Converting the UniProt IDs back to SeqIDs
+corr_fev1pp_proteins_sig <- corr_fev1pp_proteins %>%
+  filter(Q.Value <= 0.05)
+significant_proteins_fev1pp <- corr_fev1pp_proteins_sig %>% 
+  dplyr::select(SeqID) %>% unlist
+
+# Select just columns in the data that corresponding to the above proteins (nd = neutrophil degranulation)
+somascan_normalized_clean_features_log_scale_sig_fev1pp <-
+  somascan_normalized_clean_features_log_scale[,significant_proteins_fev1pp]
+
+# all(colnames(somascan_normalized_clean_features_log_scale_sig_fev1pp) == significant_proteins_fev1pp) TRUE!
+
+# Ordering the proteins according to correlation with FEV1pp
+protein_order_sig_fev1pp <- order(corr_fev1pp_proteins_sig$Correlation, decreasing = TRUE) # High positive to high negative
+
+# Ordering subjects by their FEV1pp value
+subject_order <- order(clinical_data_soma$FEV1FVC_percent_predicted, decreasing = FALSE) # Low to high
+
+# Creating a matrix for the heatmap
+soma_matrix_sig_fev1pp <- t(as.matrix(somascan_normalized_clean_features_log_scale_sig_fev1pp[subject_order, protein_order_sig_fev1pp]))
+
+# The heatmap
+par(mar=c(5,5,5,5))
+show.image(soma_matrix_sig_fev1pp)
+title(main = "Protein Expression of Proteins Significantly Correlated \n with FEV1pp", 
+      xlab = "Subjects", ylab = "Proteins", line = 1)
+mtext("Low FEV1pp", side=1, line=0, at=10)
+mtext("High FEV1pp", side=1, line=0, at=44)
+mtext("Negative \n Correlation", side=4, line=2, at=10)
+mtext("Positive \n Correlation", side=4, line=2, at=600)
+abline(v=26.5)
+par(mar = c(1,1,1,1))
+```
+```{r Heatmap for Biocrates Lavage Metabolites, warning = FALSE, message = FALSE}
+# Source the Biocrates analysis
+source("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/Lavage_Biocrates/Lavage_Biocrates_Descriptive.R")
+
+# Match the order of the metabolites to the order in the dataset
+corr_fev1pp_metabolites <- corr_fev1pp_metabolites[match(lavage_processed$Metabolite,
+                                                         corr_fev1pp_metabolites$Metabolite),]
+
+all(corr_fev1pp_metabolites$Metabolite == lavage_processed$Metabolite)
+
+# Order metabolites by their correlation with FEV1pp
+metabolite_order <- order(corr_fev1pp_metabolites$Correlation, decreasing = TRUE) 
+
+# Creating a matrix for the heatmap
+biocrates_matrix <- as.matrix(lavage_log_scaled[metabolite_order, subject_order])
+
+# Save the metabolite names
+metabolites <- lavage_processed$Metabolite
+
+# The heatmap
+par(mar=c(5,5,5,5))
+show.image(biocrates_matrix)
+title(main = "Metabolite Expression in BALF Lavage", xlab = "Subjects", ylab = "Metabolite", line = 1)
+mtext("Low FEV1pp", side=1, line=0, at=10)
+mtext("High FEV1pp", side=1, line=0, at=44)
+mtext("Negative \n Correlation", side=4, line=1, at=10)
+mtext("Positive \n Correlation", side=4, line=1, at=235)
+par(mar = c(1,1,1,1))
+```
+```{r Heatmap for Biocrates Plasma Metabolites, warning = FALSE, message = FALSE}
+# Remove overlapping variable name
+rm(corr_fev1pp_metabolites)
+
+# Source the Biocrates analysis for Plasma
+source("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/Plasma_Biocrates/Plasma_Biocrates_Descriptive.R")
+
+# Match the order of the metabolites to the order in the dataset
+corr_fev1pp_metabolites <- corr_fev1pp_metabolites[match(plasma_processed$Metabolite,
+                                                         corr_fev1pp_metabolites$Metabolite),]
+
+all(corr_fev1pp_metabolites$Metabolite == plasma_processed$Metabolite)
+
+# Order metabolites by their correlation with FEV1pp
+plasma_metabolite_order <- order(corr_fev1pp_metabolites$Correlation, decreasing = TRUE) 
+
+# Order just the subjects available in the plasma data
+subjects_in_plasma <- fev1pp[names(fev1pp) %in% colnames(plasma_processed)]
+subject_order_plasma <- order(subjects_in_plasma, decreasing = FALSE)
+
+# Creating a matrix for the heatmap
+biocrates_plasma_matrix <- as.matrix(plasma_log_scaled[plasma_metabolite_order, subject_order_plasma])
+
+# The heatmap
+par(mar=c(5,5,5,5))
+show.image(biocrates_plasma_matrix)
+title(main = "Metabolite Expression in Plasma", xlab = "Subjects", ylab = "Metabolite", line = 1)
+mtext("Low FEV1pp", side=1, line=0, at=5)
+mtext("High FEV1pp", side=1, line=0, at=40)
+mtext("Negative \n Correlation", side=4, line=1, at=50)
+mtext("Positive \n Correlation", side=4, line=1, at=235)
+par(mar = c(1,1,1,1))
+```
+
+Based on the above heatmaps, it looks like there are several subjects among the cases (those with COPD) who have interesting expression levels of proteins and metabolites. The indices for these subjects from left to right are 1, 2, 3, 7, 8, 12, 13, 16, 17. 
+
+```{r Selecting Stand-Out Subjects from Heatmap, message = FALSE, warning = FALSE}
+# Selecting the subjects who stood out from the heatmap
+subject_order <- order(clinical_data_soma$FEV1_percent_predicted, decreasing = FALSE) # Low to high
+stand_out <- c(1, 2, 3, 7, 8, 12, 13, 16, 17, 18, 27, 43)
+stand_out_subjects <- clinical_data_soma$id[subject_order][stand_out]
+
+# Check
+all(stand_out_subjects == colnames(soma_matrix)[stand_out])
+
+# Select just these subjects from the Somascan and Biocrates data
+somascan_stand_out <- soma_matrix[, stand_out]
+biocrates_stand_out <- biocrates_matrix[,stand_out]
+
+# Table 1 for stand out patients across all patients
+# library(table1)
+# table1(~ sex + age + ethnicity + smoker + art + FEV1_percent_predicted| StandOut, 
+#        data = clinical_data_soma_tab1,
+#        overall = "Total", caption = "Demographics of visually unusual patients from heatmap among all subjects.")
+# 
+# 
+# # Table 1 for stand out patients just within cases
+# clinical_data_cases <- clinical_data_soma_tab1 %>% filter(ccstat == "Case")
+# table1(~ sex + age + ethnicity + smoker + art + FEV1_percent_predicted| StandOut, 
+#        data = clinical_data_cases,
+#        overall = "Total", caption = "Demographics of visually unusual patients from heatmap among cases only.")
+```
+
+### Clustering and Stand-Out Subjects
+
+*Background*
+
+To rigorously identify which subjects stand out in the above heatmaps, we use a clustering algorithm to select which clusters stand out. We consider k-means as a rigorous approach to clustering subjects. K-means is a clustering algorithm that intuitively combines observations into clusters such that the clusters are most similar based on their within cluster variability. 
+
+*Goals*
+
+The goals of this analysis are to determine protein-driven endotypes in the proteomics data. We hope to see these endotypes or clusters match the clusters that visually appear in the heatmaps.
+
+*Methods*
+
+We consider K-means with 2 clusters applied to the data for 100 replications. We used 100 replications because K-means may converge to a local minimum and thus multiple runs of the algorithm may yield different results. We replicate K-means 100 times to achieve a robust result. We also 10 initial start values, each of which is an initial cluster configuration that is randomly assigned to each observation and from which the algorithm proceeds. This may determine the resulting final cluster scheme. Choosing 10 initial start points means the result within each replication of K-means is the result that provided the smallest within cluster variability across the two final clusters.
+
+We also use bootstrapping with K-means to quantify our uncertainty in the clustering. Resampling the data and applying K-means each time tells us how dependent each observation is on the presence of others to determine the clustering scheme. 
+
+Lastly, we consider a permutation testing scheme to compare mean protein expression between the two resulting clusters. We use the proteins that are significant at an FDR level of 0.1 to filter proteins in pathway overrepresentation analysis to determine which pathways are differentially represented between the two clusters. 
+
+We apply this sequence of steps to both the Somascan proteomics data and the Biocrates metabolomics data. We consider running a pathway analysis using the significant proteins and metabolites differentially expressed in both groups.
+
+*Results*
+
+K-means offered reliable results and was consistent for different replications and choices of starting rows. Only one cluster ID differed between k-means and outcome-guided k-means, which was ID P_50220927, who was a case. 
+
+The subjects identified in the smaller, stand-out cluster using k-means repeated 100 times on the Somascan data were P_35010, P_50220927, V_2, V_16, V_24, V_44, P_50220078, V_53, V_60, and V_320023. 
+ 
+```{r K-Means Clustering (100 Reps), message = FALSE, warning = FALSE, eval = FALSE}
+# Load in the package for timing
+library(svMisc)
+
+# Save the clustering results
+nrep <- 100
+cluster_results <- matrix(nrow = nrep, ncol = nrow(somascan_normalized_clean_features_log_scale))
+colnames(cluster_results) <- rownames(somascan_normalized_clean_features_log_scale)
+
+for (rep in 1:nrep) {
+  set.seed(rep)
+  
+  res <- kmeans(x = somascan_normalized_clean_features_log_scale,
+                centers = 2,
+                iter.max = 50,
+                nstart = 10)
+  cluster_results[rep,] <- res$cluster
+}
+
+# Setting the smaller cluster to be cluster 1 (cluster sizes were consistent across replications)
+cluster_results_renamed <- cluster_results
+for (rep in 1:nrep) {
+  # Check which cluster was smaller
+  current_clustering <- cluster_results[rep,]
+  tabulated_cluster <- table(current_clustering)
+  smaller_cluster <- which.min(tabulated_cluster)
+  
+  # Renaming the clusters
+  if (smaller_cluster != 1) {
+    cluster_results_renamed[rep,][current_clustering == 2] <- 1
+    cluster_results_renamed[rep,][current_clustering == 1] <- 2
+  }
+}
+
+# All the clusters happened to be the same each time, so just taking the colMeans
+final_clusters <- colMeans(cluster_results_renamed)
+final_clusters_sorted <- sort(final_clusters)
+
+save(cluster_results, cluster_results_renamed, final_clusters, 
+     file = paste0(somascan_wd, "KMeansClusteringResults100Reps.rda"))
+```
+```{r Results from K-Means (No Outcome) Clustering, message = FALSE, warning = FALSE}
+# Load in the results
+load(paste0(somascan_wd, "Clustering/KMeansClusteringResults100Reps.rda"), verbose = TRUE)
+
+# Creating another heatmap --
+
+# Order the subjects by their cluster
+final_clusters_sorted <- sort(final_clusters)
+subject_order_cluster <- match(names(final_clusters_sorted), clinical_data_soma$id)
+soma_matrix_cluster <- t(as.matrix(somascan_normalized_clean_features_log_scale[subject_order_cluster, protein_order]))
+
+par(mar=c(5,5,5,5))
+show.image(soma_matrix_cluster)
+title(main = "Protein Expression \n Subjects Grouped by K-Means Clusters", xlab = "Subjects", ylab = "Proteins", line = 1)
+abline(v = sum(final_clusters==1) + 0.5)
+mtext("Negative \n Correlation", side=4, line=1, at=500)
+mtext("Positive \n Correlation", side=4, line=1, at=3700)
+mtext("Cluster 1", side=1, line=0, at=5)
+mtext("Cluster 2", side=1, line=0, at=15)
+par(mar = c(1,1,1,1))
+
+# Heatmap with arrows for which subjects were identified to be in a cluster together
+inds <- which(clinical_data_soma$id[subject_order] %in% names(final_clusters[final_clusters==1]))
+
+par(mar=c(5,5,5,5))
+show.image(soma_matrix)
+title(main = "Protein Expression (Highlighting Stand-Out Individuals)", xlab = "Subjects", ylab = "Proteins", line = 1)
+arrows(x0=c(20), x1=c(35), y0=-200, y1=-200, col=c("black", "black"), length=0.15, lwd=3, xpd=TRUE)
+arrows(x0 = inds, x1 = inds, y0 = 200, y1 = 210)
+mtext("Low FEV1pp", side=1, line=0, at=10)
+mtext("High FEV1pp", side=1, line=0, at=44)
+arrows(y0=c(1200), y1=c(2300), x0=55, x1=55, col=c("black", "black"), length=0.15, lwd=3, xpd=TRUE)
+mtext("Negative \n Correlation", side=4, line=1, at=10)
+mtext("Positive \n Correlation", side=4, line=1, at=3800)
+par(mar = c(1,1,1,1))
+
+# Demographics
+# Adding to the clinical data
+clinical_data_soma_tab1$KMeansNoOut <- factor(final_clusters)
+
+# Creating a table 1
+# All subjects
+library(table1)
+table1(~ sex + age + ethnicity + smoker + art + FEV1_percent_predicted + fev1fvc + ccstat| KMeansNoOut, 
+       data = clinical_data_soma_tab1,
+       overall = "Total", caption = "Demographics of clusters determined by K-means clustering without the outcome.")
+
+```
+
+For a measure of robustness and a sense of uncertainty, we consider applying k-means again with 100 bootstrap replications. This subsampling scheme allows us to see how dependent the clusters are on the presence of the entire training dataset. The k-means algorithm was run 50 times within each replication to ensure the method finds the best clustering. The method returns a vector of observation-wise stability. 
+
+With 100 bootstrap samples, the overall stability of the clustering was 89\%. The stability among subjects who were clustered together in the smaller, stand-out, group, ranged from 49\% to 81\%. The final clusters determined by bootstrap stability matched the results we obtained when we repeated k-means 100 times. 
+
+```{r K-Means Clustering with Bootstrapping, message = FALSE, warning = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Using the bootcluster package to obtain uncertainty estimates of the identified clusters
+# Run overnight for 100 bootstrap resamplings to get better sense
+# -----------------------------------------------------------------------------
+
+# Load in the package
+library(bootcluster)
+
+# Run the stability algorithm with non-parametric bootstrapping
+set.seed(1) # Not sure if the results will be reproducible
+kmeans_stability <- stability(somascan_normalized_clean_features_log_scale, # subjs x feats
+                              k = 2, # Number of clusters
+                              B = 200,  # Number of bootstrap resamplings 
+                              r = 50, # Number of runs of k-means
+                              scheme_2 = FALSE) # Uses the original clustering of the data as reference for stability
+save(kmeans_stability, file = paste0(somascan_wd, "KMeans_Stability_Results.rda"))
+```
+```{r K-Means Clustering with Bootstrapping (Results), message = FALSE, warning = FALSE}
+# Load in the results 
+load(paste0(somascan_wd, "Clustering/KMeans_Stability_Results.rda"), verbose = TRUE)
+
+# Reference membership (the result we came to on the full training data)
+boot_membership <- kmeans_stability$membership
+names(boot_membership) <- rownames(somascan_normalized_clean_features_log_scale)
+
+# Observation-wise stability (how stably was each observation assigned a cluster?)
+obs_stability <- kmeans_stability$obs_wise
+names(obs_stability) <- rownames(somascan_normalized_clean_features_log_scale)
+
+# Looking specifically at those subjects in the smaller cluster
+obs_stability[final_clusters == 1]
+
+# Overall
+kmeans_stability$overall
+```
+
+We also considered the same permutation testing framework described previously where we compared each aptamer between the two clusters and combined p-values for aptamers mapping to the same protein using Fisher's method. The results below show the permutation testing p-values, comparing each permutation test statistic (combined p-value using Fisher's method on the permuted data) with the test statistic of Fisher's method using the original data. 
+
+We considered permuting the cluster labels across the entire sample, rather than within each case-control pair. We consider this approach to permutation testing in addition to permuting within pairs because it does not seem meaningful to only consider the pairs here. The clusters are not functions of the case-control labels, unlike case-control status and FEV1pp. 
+
+I am redoing this comparison to make sure I did it correctly. I am saving the results with the addition "_V2." It does seem like it matches what I am seeing from before. Somehow I must have deleted the code I used to do the univariate comparisons between clusters. 
+
+```{r Comparing K-Means Clusters Across Proteins, message = FALSE, warning = FALSE}
+# -----------------------------------------------------------------------------
+# Univariate comparisons of each aptamer across the clusters
+# Using 2-sample t-test to compare average aptamer level between clusters
+# -----------------------------------------------------------------------------
+
+# Initializing dataframe to store individual aptamer comparisons between clusters
+cluster_t.test_res <- data.frame(test.stat = numeric(n_proteins),
+                                 p.value = numeric(n_proteins))
+
+for (i in 1:n_proteins) { # iterating through each protein
+  # the current protein
+  protein_i <- aptamers[i]
+  
+  # extracting the cluster ids
+  cluster1_ids <- clinical_data_soma$id[final_clusters == 1]
+  cluster2_ids <- clinical_data_soma$id[final_clusters == 2]
+  
+  # subsetting the protein i levels for cases and controls
+  cluster1_protein_i <- somascan_normalized_clean_features_log_scale[which(rownames(somascan_normalized_clean_features_log_scale) %in% cluster1_ids), protein_i]
+  cluster2_protein_i <- somascan_normalized_clean_features_log_scale[which(rownames(somascan_normalized_clean_features_log_scale) %in% cluster2_ids), protein_i]
+  
+  # performing the paired t-test
+  res_i <- t.test(cluster1_protein_i, cluster2_protein_i, paired = FALSE)
+  
+  # storing the results
+  cluster_t.test_res$test.stat[i] <- res_i$statistic
+  cluster_t.test_res$p.value[i] <- res_i$p.value
+}
+
+# Apply an FDR correction to the resulting p-values
+cluster_t.test_res$q.value <- p.adjust(cluster_t.test_res$p.value, method = "fdr")
+
+# Add column for target protein names
+cluster_t.test_res$SeqID <- aptamers
+cluster_t.test_res$Protein <- protein.names.tab.reorder$`Target Name`
+cluster_t.test_res$UniProtID <- protein.names.tab.reorder$`UniProt ID`
+
+# Order by FDR
+cluster_t.test_res_reorder <- cluster_t.test_res[order(cluster_t.test_res$q.value, decreasing = FALSE),]
+
+# Reorder columns
+cluster_t.test_res_reorder <- cluster_t.test_res_reorder[,c(4,5,6,1,2,3)]
+
+# Display table
+cluster_t.test_res_reorder %>% kable(format = "html", align = "c",
+      caption = "Table of individual aptamer differences between clusters identified using Somascan data.",
+      col.names = c("SeqID", "Protein", "UniProt ID", "Test Stat", "P-Value", "Q-Value")) %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# Save resulting p-values for permutation testing
+p.values.cluster <- cluster_t.test_res$p.value
+names(p.values.cluster) <- cluster_t.test_res$SeqID
+p.values.cluster.names <- p.values.cluster
+names(p.values.cluster.names) <- cluster_t.test_res$UniProtID
+
+save(p.values.cluster, p.values.cluster.names, final_clusters, 
+     file = "/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/SomaScan/UnivariatePValuesUncombinedClusterComparison_V2.rda")
+
+# Calculating the average test statistic for the top 10 proteins with significant permutation p-values
+top_cluster_proteins <- c("Q14457", "P41235", "P84022", "Q15327", "Q9P121", 
+                          "O75962", "Q9H9V4", "Q5T601", "P31415", "P37837")
+
+cluster_t.test_res_reorder %>% filter(UniProtID %in% top_cluster_proteins) %>%
+  group_by(UniProtID) %>% 
+  dplyr::summarise(mean.test.stat = mean(test.stat)) %>%
+  dplyr::arrange(match(UniProtID, top_cluster_proteins))
+```
+
+These results did not change after repeating this procedure. The most recent results are in `cluster_ttest_combined_permutation_pvalues_10k_permute_across_sample_V2_check.rda`. The `check` signifies that I checked these results. 
+
+There were 1957 proteins with p-values below 0.05 before multiple comparisons adjustment under this permutation scheme. There were 1279 proteins that were significant at an FDR threshold of 0.05 and 1973 at an FDR threshold of 0.1.  We used the proteins that had significant q-values in pathway analysis at an FDR threshold of 0.05 to put a stricter threshold on which proteins we include. We run into a small issue of biasing ourselves towards significance because we've constructed clusters based on the data and then are doing testing to see how these clusters differ, so they are already likely to be different. This is why for now we use the q-values as a threshold, rather than p-values. 
+
+As determined by Impala, 998 out of 1279 input gene identifiers were mapped to 1005 distinct physical entities found in pathways. The gene background size is 3072. I named these results `ORA_Cluster_Permute_Across_Sample_V2_checked.csv`. 
+
+```{r Permutation Testing with K-means Clusters (Permute Across Sample), echo = FALSE, message = FALSE, warning = FALSE}
+# Remove previous permutation testing results
+rm(permutation_pvalues)
+
+# Load in results from server
+load(paste0(somascan_wd, "Clustering/cluster_ttest_combined_permutation_pvalues_10k_permute_across_sample_V2_check.rda"), verbose = TRUE)
+
+# Creating a table summarizing the permutation p-values for each protein 
+cluster_permutation_results <- data.frame(Protein = character(length(cluster1_vs_cluster2$permutation_pvalues)),
+                                          UniProtID = character(length(cluster1_vs_cluster2$permutation_pvalues)),
+                                          PValue = numeric(length(cluster1_vs_cluster2$permutation_pvalues)),
+                                          QValue = numeric(length(cluster1_vs_cluster2$permutation_pvalues)))
+
+cluster_permutation_results$UniProtID <- names(cluster1_vs_cluster2$permutation_pvalues)
+cluster_permutation_results$PValue <- cluster1_vs_cluster2$permutation_pvalues
+cluster_permutation_results$QValue <- p.adjust(cluster1_vs_cluster2$permutation_pvalues, method = "fdr")
+cluster_permutation_results$Protein <- somascan_annotations$`Full Name`[match(cluster_permutation_results$UniProtID, somascan_annotations$`UniProt ID`)]
+
+# Order the table by the q-values
+cluster_permutation_results <- cluster_permutation_results[order(cluster_permutation_results$QValue, 
+                                                                 decreasing = FALSE),]
+rownames(cluster_permutation_results) <- NULL
+
+# Print table
+cluster_permutation_results %>% kable(format = "html", align = "c",
+      caption = "Unique protein targets ordered by their permutation q-values. Top proteins were most significantly different after permutation testing and multiple comparisons adjustment between clusters. Permutation done across full sample set. ") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+```{r Using Permutation Results in Pathway Analysis for Clusters (Permute Across Sample), message = FALSE, warning = FALSE, eval = FALSE}
+# Creating a vector with the significant proteins
+# significant_proteins_cluster_V2 <- permutation_pvalues[permutation_pvalues < 0.05]
+significant_proteins_cluster <- cluster_permutation_results[cluster_permutation_results$QValue < 0.05,]
+
+# Saving the UniProt IDs in a text file to upload
+UniProtID_file <- file(paste0(somascan_wd, "UniProtIDs_for_Significant_Proteins_Permutation_Testing10k_Cluster_Comparison_Permute_Across_Sample_V2_check.txt"))
+writeLines(significant_proteins_cluster$UniProtID, UniProtID_file)
+close(UniProtID_file)
+
+# Checking that the reference file still contains all the protein IDs that I want
+reference_file <- read.table(paste0(somascan_wd, "UniProtIDs_for_Reference_Proteins.txt"))
+all(reference_file[,1] %in% names(cluster1_vs_cluster2$permutation_pvalues))
+all(names(cluster1_vs_cluster2$permutation_pvalues) %in% reference_file[,1])
+```
+```{r ORA Results (Cluster, Permute Across Sample), message = FALSE, warning = FALSE}
+# Load in the results
+ora_cluster <- read.csv(paste0(somascan_wd, "Clustering/ORA_Cluster_Permute_Across_Sample_V2_checked.csv"))
+
+# Remove the overlapping genes column
+ora_cluster %<>% dplyr::select(-overlapping_genes)
+
+# Display
+ora_cluster %>% kable(format = "html", align = "c",
+      caption = "Overrepresentation analysis results when considering differences between clusters and permuting across the entire sample set.", col.names = c("Pathway", "Source", "# Overlapping Genes", "# All Pathway Genes", "P-Value", "Q-Value")) %>% kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+The drawback to this approach is that we are essentially double-dipping into our data: we use the data to determine the clusters, then use the data again to compare which proteins are differentially expressed between the two clusters. Using standard Wald tests to compare these two clusters will lead to inflated Type I errors. We considered the selective inference approach proposed by Gao et al. (2021) as an alternative, but this only offers an overall significance for the expression of proteins between the two clusters, not an individual significance for each protein. Because we are not interpreting the individual protein significance results directly, we achieve some measure of separation between this issue and our interpretation of the results. 
+
+We then considered clusters determined using the Biocrates data. The Biocrates data also showed consistent clustering results across 100 replications of K-means. There were two consistent clusters: one of size 10 and one of size 42. To address the label switching problem, we rename the smaller cluster of 10 to be cluster 1 and the larger cluster to be cluster 2. The cluster of 10 was not consistently the same people, unlike with the Somascan data, because the average cluster labels were 1, 1.01, and 2. So some subjects who were mostly categorized with cluster 1 were sometimes put in cluster 2, or just once out of 100 replications. 
+
+```{r K-Means Clustering Using Entire Biocrates Data, message = FALSE, warning = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Applying k-means to the Biocrates data 
+# -----------------------------------------------------------------------------
+
+# Save the clustering results
+nrep <- 100
+cluster_results_biocrates <- matrix(nrow = nrep, ncol = ncol(lavage_log_scaled))
+colnames(cluster_results_biocrates) <- colnames(lavage_log_scaled)
+
+for (rep in 1:nrep) {
+  set.seed(rep)
+
+  res <- kmeans(x = t(lavage_log_scaled),
+                centers = 2,
+                iter.max = 50,
+                nstart = 10)
+  cluster_results_biocrates[rep,] <- res$cluster
+}
+
+# Setting the smaller cluster to be cluster 1 (cluster sizes were consistent across replications)
+cluster_results_biocrates_renamed <- cluster_results_biocrates
+for (rep in 1:nrep) {
+  # Check which cluster was smaller
+  current_clustering <- cluster_results_biocrates[rep,]
+  tabulated_cluster <- table(current_clustering)
+  smaller_cluster <- which.min(tabulated_cluster)
+
+  # Renaming the clusters
+  if (smaller_cluster != 1) {
+    cluster_results_biocrates_renamed[rep,][current_clustering == 2] <- 1
+    cluster_results_biocrates_renamed[rep,][current_clustering == 1] <- 2
+  }
+}
+
+# All the clusters happened to be the same each time, so just taking the colMeans
+final_clusters_biocrates <- colMeans(cluster_results_biocrates_renamed)
+final_clusters_biocrates[final_clusters_biocrates < 2] <- 1
+final_clusters_biocrates[final_clusters_biocrates > 1] <- 2
+final_clusters_biocrates_sorted <- sort(final_clusters_biocrates)
+
+# Save these results
+save(cluster_results_biocrates, cluster_results_biocrates_renamed, final_clusters_biocrates, 
+     file = paste0(somascan_wd, "BiocratesKMeansClusteringResults100Reps.rda"))
+```
+
+The individuals that belonged to the smaller cluster were P_30521, P_130, P_63, V_2, V_16, V_24, V_44, V_53, V_76, and V_320023. The individuals belonging to the smaller cluster using the Somascan data were P_35010, P_50220927, V_2, V_16, V_24, V_44, P_50220078, V_53, V_60, and V_320023, so an overlap of 6 individuals. This also aligns with the 6 individuals who stood out in the joint structure from the Bayesian PMF model. It is validating to see some consistent results. 
+
+```{r K-Means Clustering Using Entire Biocrates Data (Results), message = FALSE, warning = FALSE}
+# Load in the final clustering results
+load(paste0(somascan_wd, "Clustering/BiocratesKMeansClusteringResults100Reps.rda"), verbose = TRUE)
+
+# Making new heatmaps
+# Order the subjects by their cluster
+subject_order_cluster_biocrates <- match(names(sort(final_clusters_biocrates)), colnames(lavage_log_scaled))
+biocrates_matrix_cluster <- (as.matrix(lavage_log_scaled[metabolite_order, subject_order_cluster_biocrates]))
+
+par(mar=c(5,5,5,5))
+show.image(biocrates_matrix_cluster)
+title(main = "Metabolite Expression \n Subjects Grouped by K-Means Clusters", xlab = "Subjects", ylab = "Metabolites", line = 1)
+abline(v = sum(final_clusters_biocrates==1) + 0.5)
+mtext("Negative \n Correlation", side=4, line=1, at=30)
+mtext("Positive \n Correlation", side=4, line=1, at=210)
+mtext("Cluster 1", side=1, line=0, at=5)
+mtext("Cluster 2", side=1, line=0, at=15)
+par(mar = c(1,1,1,1))
+
+# Heatmap with arrows for which subjects were identified to be in a cluster together
+inds <- which(clinical_data_soma$id[subject_order] %in%
+                names(final_clusters_biocrates[final_clusters_biocrates==1]))
+
+par(mar=c(5,5,5,5))
+show.image(biocrates_matrix)
+title(main = "Metabolite Expression", xlab = "Subjects", ylab = "Metabolites", line = 1)
+arrows(x0=c(20), x1=c(35), y0=-200, y1=-200, col=c("black", "black"), length=0.15, lwd=3, xpd=TRUE)
+arrows(x0 = inds, x1 = inds, y0 = 10, y1 = 15)
+mtext("Low FEV1pp", side=1, line=0, at=10)
+mtext("High FEV1pp", side=1, line=0, at=44)
+abline(v = 26.5)
+par(mar = c(1,1,1,1))
+
+# Demographics
+# Adding to the clinical data
+clinical_data_soma_tab1$KMeansNoOutBiocrates <- factor(final_clusters_biocrates)
+
+# Check
+# all(names(final_clusters_biocrates) == clinical_data_soma_tab1$id) # TRUE!
+
+# Creating a table 1
+# All subjects
+library(table1)
+table1(~ sex + age + ethnicity + smoker + art + FEV1_percent_predicted + fev1fvc + ccstat| KMeansNoOutBiocrates, 
+       data = clinical_data_soma_tab1,
+       overall = "Total", caption = "Demographics of clusters determined by K-means clustering on Biocrates data without the outcome.")
+```
+
+As mentioned earlier, there were 6 subjects who overlapped in the clusters derived from the Somascan and from the Biocrates data. The demographics of these patients are presented in the following table.
+
+```{r Overlap Subjects Between Somascan and Biocrates Clusters, message = FALSE, warning = FALSE}
+# The IDs of the 6 overlapping subjects
+# overlap_subjs <- c("V_320023", "V_2", "V_16", "V_24", "V_44", "V_53")
+overlap_subjs <- names(final_clusters[final_clusters==1])[names(final_clusters[final_clusters==1]) %in% names(final_clusters_biocrates[final_clusters_biocrates==1])]
+
+# Add a column that is a binary indicator for these overlapping individuals
+clinical_data_soma_tab1$OverlapSubjs <- clinical_data_soma_tab1$id %in% overlap_subjs
+clinical_data_soma_tab1$OverlapSubjs[clinical_data_soma_tab1$OverlapSubjs==TRUE] <- "Overlapping"
+clinical_data_soma_tab1$OverlapSubjs[clinical_data_soma_tab1$OverlapSubjs=="FALSE"] <- "Non-Overlapping"
+
+# Creating a demographics table
+library(table1)
+table1(~ sex + age + ethnicity + smoker + art + FEV1_percent_predicted + ccstat| OverlapSubjs, 
+       data = clinical_data_soma_tab1,
+       overall = "Total", caption = "Demographics of the subjects that were consistently clustered together in the smaller, stand-out cluster in both the Somascan and Biocrates data.")
+```
+
+We then consider applying the bootstrap stability algorithm to assess how stable these Biocrates clusters were. Overall, the stability was around 0.794, which is a bit lower than what we saw with the Somascan data but comparable. The individual stabilities were also comparable to what we saw with Somascan - the ranges were between 0.42 and 0.86. For just the smaller cluster, this ranged from 0.42 to 0.71. The final clusters determined based on bootstrap stability matched the k-means clusters we obtained by repeating k-means 100 times. 
+
+```{r K-Means Boostrapping with Biocrates, message = FALSE, warning = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Using the bootcluster package to obtain uncertainty estimates of the identified clusters
+# Run overnight for 100 bootstrap resamplings to get better sense
+# -----------------------------------------------------------------------------
+
+# Load in the package
+library(bootcluster)
+
+# Run the stability algorithm with non-parametric bootstrapping
+set.seed(1) # Not sure if the results will be reproducible
+kmeans_stability_biocrates <- stability(t(lavage_log_scaled), # subjs x feats
+                                        k = 2, # Number of clusters
+                                        B = 100,  # Number of bootstrap resamplings 
+                                        r = 50, # Number of runs of k-means
+                                        scheme_2 = FALSE) # Uses the original clustering of the data as reference for stability
+save(kmeans_stability_biocrates, file = paste0(somascan_wd, "Biocrates_KMeans_Stability_Results.rda"))
+```
+```{r K-Means Boostrapping with Biocrates (Results), message = FALSE, warning = FALSE}
+# Load in the results 
+load(paste0(somascan_wd, "Clustering/Biocrates_KMeans_Stability_Results.rda"))
+
+# Reference membership (the result we came to on the full training data)
+boot_membership_biocrates <- kmeans_stability_biocrates$membership
+names(boot_membership_biocrates) <- colnames(lavage_log_scaled)
+
+# Observation-wise stability (how stably was each observation assigned a cluster?)
+obs_stability_biocrates <- kmeans_stability_biocrates$obs_wise
+names(obs_stability_biocrates) <- colnames(lavage_log_scaled)
+
+# Looking specifically at those subjects in the smaller cluster
+obs_stability_biocrates[final_clusters_biocrates == 1]
+
+# Overall
+kmeans_stability_biocrates$overall
+```
+
+Next, we do univariate comparisons of each metabolite between the two clusters. We will use these as a baseline to do permutation testing comparing each metabolite between the two clusters. Since there are fewer metabolites and we do not have to combine metabolites across aptamers like we do with proteins, I will do the permutation testing locally. 
+
+```{r Comparing Metabolites Across K-Means Clusters, message = FALSE, warning = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Metabolite-by-metabolite comparisons between the two derived clusters
+# -----------------------------------------------------------------------------
+
+# Initializing dataframe to store individual metabolite comparisons between clusters
+cluster_t.test_biocrates_res <- data.frame(test.stat = numeric(n_metabolite),
+                                           p.value = numeric(n_metabolite))
+
+# Save the names of the metabolites
+metabolites <- lavage_processed$Metabolite
+
+# Check that the order matches
+# all(colnames(lavage_log_scaled) == names(final_clusters_biocrates)) # TRUE!
+
+# Extracting the cluster ids
+cluster1_ids <- colnames(lavage_log_scaled)[final_clusters_biocrates == 1]
+cluster2_ids <- colnames(lavage_log_scaled)[final_clusters_biocrates == 2]
+
+# Cluster 1 metabolite data
+lavage_log_scaled_cluster1 <- lavage_log_scaled[,cluster1_ids]
+lavage_log_scaled_cluster2 <- lavage_log_scaled[,cluster2_ids]
+
+for (i in 1:n_metabolite) { # iterating through each metabolite
+  # the current metabolite
+  metabolite_i <- metabolites[i]
+  
+  # subsetting the protein i levels for cases and controls
+  cluster1_metabolite_i <- lavage_log_scaled_cluster1[i,]
+  cluster2_metabolite_i <- lavage_log_scaled_cluster2[i,]
+
+  # performing the t-test
+  res_i <- t.test(cluster1_metabolite_i, cluster2_metabolite_i, paired = FALSE)
+  
+  # storing the results
+  cluster_t.test_biocrates_res$test.stat[i] <- res_i$statistic
+  cluster_t.test_biocrates_res$p.value[i] <- res_i$p.value
+}
+
+# Save the results
+save(cluster_t.test_biocrates_res, file = paste0(somascan_wd, "Univariate_Metabolites_Cluster.rda"))
+```
+```{r Comparing Metabolites Across K-Means Clusters (Results), message = FALSE, warning = FALSE}
+# Loading in the results
+load(paste0(somascan_wd, "Clustering/Univariate_Metabolites_Cluster.rda"), verbose = TRUE)
+
+# Apply an FDR correction to the resulting p-values
+cluster_t.test_biocrates_res$q.value <- p.adjust(cluster_t.test_biocrates_res$p.value, method = "fdr")
+
+# Add column for target protein names
+cluster_t.test_biocrates_res$Metabolite <- metabolites
+
+# Order by FDR
+cluster_t.test_biocrates_res_reorder <- cluster_t.test_biocrates_res[order(cluster_t.test_biocrates_res$q.value, decreasing = FALSE),]
+
+# Reorder columns
+cluster_t.test_biocrates_res_reorder <- cluster_t.test_biocrates_res_reorder[,c(4,1,2,3)]
+
+# Display table
+cluster_t.test_biocrates_res_reorder %>% kable(format = "html", align = "c",
+      caption = "Table of individual metabolite differences between clusters identified using Biocrates data.",
+      col.names = c("Metabolite", "Test Stat", "P-Value", "Q-Value")) %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+```
+
+Since there are fewer metabolites and we do not have to combine metabolites across aptamers like we do with proteins, I will do the permutation testing locally. There were 18 metabolites that were significant at the 0.1 level following permutation testing. The results are displayed in the following table. All the q-values were equal to 1, suggesting there is not much power to detect differences in metabolite expression between the two clusters. 
+
+I use a threshold of p < 0.1 to filter metabolites for pathway analysis. This may be too small a size to do pathway analysis with metabolites alone, but I will try. I considered p < 0.05 but this yielded only 9 metabolites, none of which were mapped to pathways. 
+
+The results of the pathway analysis are as follows. 2 of 18 metabolites were mapped to pathways. Thus, only 1 metabolite was ever overlapping with a particular pathway. 
+
+```{r Permutation Testing with Metabolites and K-Means Clusters, message = FALSE, warning = FALSE, eval = FALSE}
+# -----------------------------------------------------------------------------
+# Permutation testing with metabolites 
+# Permute the cluster labels across the sample set, compare metabolite levels,
+# store p-value. 
+# Repeat for 10k iterations
+# Calculate permutation p-value: compare permutation p-values to original
+# -----------------------------------------------------------------------------
+
+# Calculate the permutation p-values for 10k permutations of the cluster labels
+n.permute <- 10000 # Number of permutations
+labels <- final_clusters_biocrates; names(labels) <- NULL # Remove names so I don't get confused
+labels[labels == 2] <- -1 # Change the labels to -1 (cluster 2) and 1 (cluster 1)
+data <- t(lavage_log_scaled) # Transpose the lavage data so that I don't have to change the indexing
+
+# Create a matrix with n.permute results for each metabolite
+p.values.permute.mat <- matrix(nrow = n.permute, ncol = n_metabolite)
+colnames(p.values.permute.mat) <- metabolites
+for (iter in 1:n.permute) {
+  # Set seed
+  set.seed(iter)
+  
+  # Permute the labels across sample
+  permute.labels <- permute(labels)
+  
+  # T-Testing for each metabolite
+  permuted_pvalues <- c()
+  for (i in 1:n_metabolite) { # iterating through each protein
+    # extracting the case and control ids
+    case_ids <- colnames(lavage_log_scaled)[permute.labels == 1]
+    control_ids <- colnames(lavage_log_scaled)[permute.labels == -1]
+    
+    # subsetting the protein i levels for cases and controls
+    case_metabolite_i <- data[which(rownames(data) %in% case_ids), i]
+    control_metabolite_i <- data[which(rownames(data) %in% control_ids), i]
+    
+    # performing the paired t-test
+    res_i <- t.test(case_metabolite_i, control_metabolite_i, paired = FALSE)
+    
+    # storing the results
+    permuted_pvalues[i] <- res_i$p.value
+  }
+  
+  # Return the permuted p-value vector
+  p.values.permute.mat[iter,] <- permuted_pvalues
+}
+
+# Calculate permutation p-value for each metabolite
+permutation_pvalues_metabolite <- c()
+for (i in 1:n_metabolite) {
+  # Original test statistic
+  original_test_stat <- cluster_t.test_biocrates_res$p.value[i]
+  
+  # Permutation test statistics
+  permutation_test_stats <- p.values.permute.mat[, i]
+  
+  # Computing the number of times the original test statistic > permutation test stats
+  permutation_pvalues_metabolite[i] <- (sum(permutation_test_stats > original_test_stat) + 1)/(n.permute + 1) 
+}
+names(permutation_pvalues_metabolite) <- metabolites
+
+# Save the results
+save(permutation_pvalues_metabolite, file = paste0(somascan_wd, "Biocrates_Permutation_Testing_Cluster_Results.rda"))
+```
+```{r Biocrates Permutation Testing Results, message = FALSE, warning = FALSE}
+# Load in the results
+load(paste0(somascan_wd, "Clustering/Biocrates_Permutation_Testing_Cluster_Results.rda"), verbose = TRUE)
+
+# Create table
+biocrates_perm_df <- data.frame(Metabolite = metabolites,
+                                P.Value = permutation_pvalues_metabolite)
+biocrates_perm_df$Q.Value <- p.adjust(biocrates_perm_df$P.Value, method = "fdr")
+
+biocrates_perm_df_reorder <- biocrates_perm_df[order(biocrates_perm_df$P.Value, decreasing = FALSE),]
+
+biocrates_perm_df_reorder %>% kable(format = "html", align = "c",
+      caption = "Table of individual metabolite differences between clusters identified using Biocrates data using permutation testing..",
+      col.names = c("Metabolite", "P-Value", "Q-Value")) %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+
+# -----------------------------------------------------------------------------
+# Saving these metabolites for pathway analysis 
+# -----------------------------------------------------------------------------
+
+# The names of the significant metabolites prior to FDR
+# significant_metabolites <- biocrates_perm_df$Metabolite[biocrates_perm_df$P.Value < 0.1]
+
+# Load in a reference file for the metabolite names from the Biocrates analysis
+
+# Obtain the corresponding ChEBI name for each metabolite
+# significant_metabolites_cluster_CHEBI <- metabolite_ids_raw_data %>% 
+#   filter(`Metabolite Name` %in% significant_metabolites) %>%
+#   dplyr::select(`Bio ID`)
+
+# Save
+# Biocrates_ORA_file <- file(paste0(somascan_wd, "Clustering/Significant_Metabolites_Clusters_Permutation.txt"))
+# writeLines(unlist(significant_metabolites_cluster_CHEBI), Biocrates_ORA_file)
+# close(Biocrates_ORA_file)
+
+# Saving a reference file 
+# metabolites_reference_CHEBI <- metabolite_ids_raw_data %>% 
+#   filter(`Metabolite Name` %in% metabolites) %>%
+#   dplyr::select(`Bio ID`)
+
+# Save
+# Biocrates_Reference_ORA_file <- file(paste0(somascan_wd, "Metabolite_Reference_File_for_ORA.txt"))
+# writeLines(unlist(metabolites_reference_CHEBI), Biocrates_Reference_ORA_file)
+# close(Biocrates_Reference_ORA_file)
+# 
+# # ORA Results
+# ORA_Cluster_Biocrates_Results <- read.csv(paste0(somascan_wd, "ORA_Cluster_Biocrates_Results.csv"))
+# ORA_Cluster_Biocrates_Results %>% kable(format = "html", align = "c",
+#       caption = "ORA results using metabolites significant at 0.1 level between K-means clusters.") %>% 
+#   kable_styling(full_width = F) 
+```
+
+We then considered the significant proteins and metabolites in the same pathway analysis using Impala. The results from the combined pathway analysis are as follows. It seems that these results are dominated by the results from the protein data, which makes sense given how many more proteins were significantly different between the two clusters.
+
+```{r Combined Pathway Analysis Proteins and Metabolites, message = FALSE, warning = FALSE}
+# Loading in the results
+ORA_Combined_Results <- read.csv(paste0(somascan_wd, "Clustering/ORA_Combined_Protein_Metabolite_Results.csv"))
+
+# Remove long columns
+ORA_Combined_Results <- ORA_Combined_Results %>% dplyr::select(-c(overlapping_genes))
+
+# Display
+ORA_Combined_Results %>% kable(format = "html", align = "c",
+      caption = "Combined ORA results. Mostly dominated by protein pathways.") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height = "500px")
+```
+
+
+### JIVE and Combined K-Means
+
+*Background*
+
+In the previous analysis, we considered clustering on the Somascan and Biocrates data separately. We combined the results in the end by considering the significant proteins and metabolites that were different between the two identified clusters in one pathway analysis. Since 6 subjects overlapped between the two clusters schema, we consider here naively combining the datasets and running K-means. We also consider a more sophisticated unsupervised method, JIVE, to identify shared patterns between the two datasets. 
+
+*Goal*
+
+The goal of this analysis is to obtain clusters driven by protein and metabolite expression simultaneously. We would like to compare the resulting clusters to those obtained from clustering on Somascan or Biocrates alone. 
+
+*Methods*
+
+We combine the Somascan and Biocrates data by their columns as they overlap in subjects. We then apply K-means with 2 clusters to the entire dataset. We consider 100 replications as before and 10 initial start values. The K-means analysis will follow the same structure as that given previously. 
+
+We then consider JIVE, which identifies factors analogous to principal components that explain variability in the observations shared in both datasets and factors unique to each dataset. We consider JIVE where the ranks are determined via permutation. 
+
+*Results: K-Means*
+
+We first consider K-means on the combined data. The results across 100 replications were consistent, as we saw previously. There were consistently two clusters of size 10 and 42. These subjects in the smaller cluster were the same as that determined by clustering on the Somascan data. These results may match because the Somascan data is so much larger in dimension than the Biocrates data and dominates the K-means algorithm. At first, I thought this wouldn't be possible because the features were centered and scaled in each dataset, but K-means depends on how close each observation is the centroid, or vector of feature means, for each cluster. There are far more means from the Somascan data than the Biocrates data, so similarity across the Somascan data takes precedent over the Biocrates data. This is actually an argument for JIVE, which would not suffer from this issue. 
+
+```{r K-Means on combined Somascan and Biocrates, message = FALSE, warning = FALSE}
+# Combining Somascan and Biocrates
+soma_bioc_data <- t(rbind(t(somascan_normalized_clean_features_log_scale), lavage_log_scaled))
+
+# K-means on the full dataset
+nrep <- 100
+cluster_results_soma_bioc <- matrix(nrow = nrep, ncol = nrow(soma_bioc_data))
+colnames(cluster_results_soma_bioc) <- rownames(soma_bioc_data)
+
+for (rep in 1:nrep) {
+  set.seed(rep)
+
+  res <- kmeans(x = soma_bioc_data,
+                centers = 2,
+                iter.max = 50,
+                nstart = 10)
+  cluster_results_soma_bioc[rep,] <- res$cluster
+}
+
+# What are the sample sizes of each cluster across the replications?
+apply(cluster_results_soma_bioc, 1, table)
+
+# Change the smaller cluster of size 10 to always be labeled cluster 1 
+
+# Save a new matrix to store these relabeled clusters
+cluster_results_soma_bioc_relabel <- cluster_results_soma_bioc
+
+for (rep in 1:nrep) {
+  # Save the current clustering
+  cluster_rep <- cluster_results_soma_bioc[rep,]
+  
+  # If the smaller cluster is already labeled 1 then do nothing; otherwise, relabel
+  if (which.min(table(cluster_rep)) == 2) { # If the smaller cluster was labeled 2
+    cluster_results_soma_bioc_relabel[rep,][cluster_rep == 1] <- 2
+    cluster_results_soma_bioc_relabel[rep,][cluster_rep == 2] <- 1
+  }
+}
+
+# The final clusters are:
+soma_bioc_final_clusters <- colMeans(cluster_results_soma_bioc_relabel)
+
+# Check
+all(soma_bioc_final_clusters %in% c(1,2)) # Everyone was assigned to one whole number cluster, TRUE!
+
+# Who belonged to the smaller cluster?
+soma_bioc_final_clusters[soma_bioc_final_clusters==1]
+```
+
+*Results: JIVE*
+
+JIVE estimated a single joint component, 9 Somascan components, and 6 Biocrates components. As we have seen with our Bayesian work, the clusters entirely separate along Somascan factors. These clusters are not as apparent with Biocrates components. The joint structure explains almost 20\% of the variation in both sources, while the individual structure in the Somascan data accounts for about 60\% of the variation. In the Biocrates data, the individual structure accounts for about 20\% of the variability.
+
+We consider K-means clustering on the single joint component derived from the proteomic and metabolomic data. We use 2 clusters and consider 100 replications, 50 iterations, and 10 random start values. The results were also consistent across replications: two clusters of sizes 5 and 42. The smaller cluster consisted of the following subjects:  V_2, V_16, V_24, V_44, and V_53. These subjects stood out in the separate Somascan and Biocrates clustering analyses. The separate analyses also overlapped in subject V_320023, who was not picked up on here. 
+
+The demographics of these 5 individuals mirror the demographics seen previously. Unfortunately there is no way to do pathway analysis using these results, perhaps we could consider a certain threshold magnitude of loading across the features from both datasets? That feels ad-hoc and a bit hand-wavey because the threshold selected would be arbitrary. Overall, it seems the loadings for hte metabolites range more highly, but there are far more proteins. Again, I wonder if the dimensions of the data sources plays any role. 
+
+```{r JIVE on Combined Somascan and Biocrates, message = FALSE, warning = FALSE, eval = FALSE}
+# Load in JIVE package
+library(r.jive)
+
+# Save the data into a list
+soma_bioc_data_list <- list(Protein = t(somascan_normalized_clean_features_log_scale),
+                            Metabolite = lavage_log_scaled)
+
+# Run JIVE
+soma_bioc_jive <- jive(soma_bioc_data_list, method = "perm")
+
+# Save the results
+save(soma_bioc_jive, file = paste0(somascan_wd, "Somascan_Biocrates_JIVE_Results.rda"))
+```
+```{r JIVE on Somascan and Biocrates (Results), message = FALSE, warning = FALSE}
+# Displaying the results from fitting JIVE on Somascan and Biocrates data
+library(r.jive)
+
+# Load in the results
+load(paste0(somascan_wd, "Clustering/Somascan_Biocrates_JIVE_Results.rda"), verbose = TRUE)
+
+# Visualize the proportion of variance explained
+showVarExplained(soma_bioc_jive)  
+
+# PCA plot
+library(viridis)
+colors <- soma_bioc_final_clusters
+colors[colors == 1] <- viridis(2)[1]; colors[colors == 2] <- viridis(2)[2]
+showPCA(soma_bioc_jive, n_joint = 2, Colors = colors, pch = 16)
+showPCA(soma_bioc_jive, n_indiv = c(2,0), Colors = colors, pch = 16)
+showPCA(soma_bioc_jive, n_indiv = c(0,2), Colors = colors, pch = 16)
+```
+```{r K-Means on the JIVE Components, message = FALSE, warning = FALSE}
+# Running K-means on the joint scores to obtain clusters
+
+# Save the joint structure
+soma_bioc_joint <- soma_bioc_jive$joint
+
+# Save the joint scores
+soma_bioc_joint_scores <- svd(soma_bioc_joint[[1]])$v[,1,drop=FALSE]
+rownames(soma_bioc_joint_scores) <- rownames(somascan_normalized_clean_features_log_scale)
+
+# K-Means on the single joint component
+nrep <- 100
+soma_bioc_joint_cluster_results <- matrix(nrow = nrep, ncol = nrow(soma_bioc_joint_scores))
+colnames(soma_bioc_joint_cluster_results) <- rownames(soma_bioc_joint_scores)
+
+for (rep in 1:nrep) {
+  set.seed(rep)
+  
+  res <- kmeans(x = soma_bioc_joint_scores,
+                centers = 2,
+                iter.max = 50,
+                nstart = 10)
+  soma_bioc_joint_cluster_results[rep,] <- res$cluster
+}
+
+# Consistent clusters of size 5 and 47 - rename to the same
+soma_bioc_joint_cluster_results_relabel <- soma_bioc_joint_cluster_results
+for (rep in 1:nrep) {
+  # Save the current cluster
+  current_rep <- soma_bioc_joint_cluster_results[rep,]
+  
+  # If the smaller cluster is labeled 2, relabel to 1
+  if (which.min(table(current_rep)) == 2) {
+    soma_bioc_joint_cluster_results_relabel[rep,][current_rep == 2] <- 1
+    soma_bioc_joint_cluster_results_relabel[rep,][current_rep == 1] <- 2
+  }
+}
+
+# The final clusters are:
+soma_bioc_joint_final_clusters <- colMeans(soma_bioc_joint_cluster_results_relabel)
+
+# Check
+all(soma_bioc_joint_final_clusters %in% c(1,2)) # TRUE!
+
+# Which subjects went into the smaller cluster?
+soma_bioc_joint_final_clusters[soma_bioc_joint_final_clusters==1]
+
+# Table 1 with joint cluster demographics
+clinical_data_soma_tab1$KMeansJoint <- factor(soma_bioc_joint_final_clusters)
+
+# Creating a table 1
+# All subjects
+library(table1)
+table1(~ sex + age + ethnicity + smoker + art + FEV1_percent_predicted + ccstat| KMeansJoint, 
+       data = clinical_data_soma_tab1,
+       overall = "Total", caption = "Demographics of clusters determined by K-means clustering on the joint component identified by JIVE as explaining variability between proteomic and metabolomic data.")
+
+# Save the joint loadings and plot
+soma_bioc_joint_loadings <- list(Protein = svd(soma_bioc_joint[[1]])$u[,1,drop=FALSE],
+                                 Metabolite = svd(soma_bioc_joint[[2]])$u[,1,drop=FALSE])
+
+# Barplot of the Somascan loadings
+soma_joint_loadings <- data.frame(Protein = aptamers,
+                                  Loading = soma_bioc_joint_loadings[[1]])
+soma_joint_loadings <- soma_joint_loadings[order(soma_joint_loadings$Loading, decreasing = TRUE),]
+barplot(soma_joint_loadings$Loading, col = "blue", main = "Loadings for Proteins in Joint Structure")
+
+# Barplot of the Biocrates loadings
+biocrates_joint_loadings <- data.frame(Metabolite = metabolites,
+                                       Loading = soma_bioc_joint_loadings[[2]])
+biocrates_joint_loadings <- biocrates_joint_loadings[order(biocrates_joint_loadings$Loading, decreasing = TRUE),]
+barplot(biocrates_joint_loadings$Loading, col = "blue", main = "Loadings for Metabolites in Joint Structure")
+```
+
+
+### Association with DLCO
+
+In this section, we test the correlation between each protein and DLCO. DLCO is a measure of lung function where lower values indicate more severe lung disease and higher values suggest normal lung function. Lower values of DLCO are typically associated with emphysema. DLCO values were only available for the Pittsburgh cohort, so we subset the proteomic data to include just the Pittsburgh individuals. One patient was not available in the proteomics dataset, P_52260024, who was present in the Pittsburgh clinical data and the overall clinical data. I removed this subject while cleaning the data earlier because their information had not been present in the original Somascan data provided. 
+
+No proteins were significantly correlation with DLCO after FDR adjustment. Even prior to FDR adjustment, the p-values were not very low. This may be due to the small sample size (31) relative to the number of proteins (4253) testing against. 
+
+
+```{r Test for Association with DLCO, echo = FALSE, message = FALSE, warning = FALSE}
+# Loading in the Pittsburgh samples only
+pittsburgh_dlco <- read_xlsx("/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/Lavage_Biocrates/Pittsburgh_Samples_DLCO_pp.xlsx")
+
+# Convert the DLCOpp column to numeric - this will induce NAs because there are missing values
+pittsburgh_dlco$DLCO_precent_predicted <-
+  as.numeric(pittsburgh_dlco$DLCO_precent_predicted)
+
+# Save the Pittsburgh patient IDs with available DLCOpp values
+pittsburgh_ids <- pittsburgh_dlco$id[!is.na(pittsburgh_dlco$DLCO_precent_predicted)]
+
+# Subset the protein data to contain just these Pittsburgh patient IDs
+somascan_normalized_clean_features_log_scale_pittsburgh <- 
+  somascan_normalized_clean_features_log_scale[rownames(somascan_normalized_clean_features_log_scale) %in% pittsburgh_ids,]
+
+# Refine the list of Pittsburgh patient IDs since one Pittsburgh individual was not in the Somascan data
+pittsburgh_ids <- pittsburgh_ids[pittsburgh_ids %in% rownames(somascan_normalized_clean_features_log_scale_pittsburgh)]
+
+# Subset the DLCOpp data to contain just the subjects for whom we had proteomic data
+pittsburgh_dlco_avail <- pittsburgh_dlco %>% filter(id %in% pittsburgh_ids)
+
+# Ensure the order of subjects matches with the order of DLCO values
+all(pittsburgh_dlco_avail$id == rownames(somascan_normalized_clean_features_log_scale_pittsburgh)) # TRUE!
+
+# Initialize datafame with columns for protein, test stat, p-value, q-value from 
+# Pearson correlation test
+dlco_corr <- data.frame(SeqID = character(n_proteins),
+                        Protein = character(n_proteins),
+                        TestStat = numeric(n_proteins),
+                        PValue = numeric(n_proteins),
+                        QValue = numeric(n_proteins))
+
+# Iterate through proteins, test for correlation with DLCO, save in dataframe
+for (i in 1:n_proteins) {
+  # Calculate Pearson correlation test with DLCO
+  res <- cor.test(somascan_normalized_clean_features_log_scale_pittsburgh[,i],
+                  pittsburgh_dlco_avail$DLCO_precent_predicted)
+  
+  # Save the results
+  dlco_corr$SeqID[i] <- colnames(somascan_normalized_clean_features_log_scale_pittsburgh)[i]
+  dlco_corr$TestStat[i] <- res$statistic
+  dlco_corr$PValue[i] <- res$p.value
+}
+
+# Add protein target names
+# Check:
+# all(protein.names.tab.reorder$SeqID == dlco_corr$SeqID) # TRUE!
+dlco_corr$Protein <- protein.names.tab.reorder$`Target Name`
+
+# Calculate multiple comparisons adjustment
+dlco_corr$QValue <- p.adjust(dlco_corr$PValue, method = "fdr")
+
+# Order by q-value
+dlco_corr <- dlco_corr[order(dlco_corr$QValue, decreasing = FALSE),]
+
+# Display table
+kable(dlco_corr, format = "html", align = "c",
+      col.names = c("SeqID", "Protein", "Test Stat", "P-Value", "Q-Value"),
+      caption = "Correlation between proteins and DLCO. ") %>% 
+  kable_styling(full_width = F) %>% 
+  scroll_box(height = "500px")
+```
