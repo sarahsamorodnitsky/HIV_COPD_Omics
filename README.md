@@ -1,2 +1,2 @@
 # HIV_COPD_Omics
- Analyses for BALF proteomics and metabolomics, as well as plasma metabolomics
+This repository contains all code for analysis of BALF proteomics and BALF and plasma metabolomics data for individuals identified from the Pittsburgh and Vancouver Lung HIV Cohorts. `SomaScan_Complete_Analysis.Rmd` contains the full analysis of BALF proteomics. `Lavage_Biocrates_Complete_Analysis` contains the analysis of BALF metabolomics. This .Rmd file loads in `Lavage_Biocrates_DataFormattingAndChecker.R` and `Lavage_Biocrates_Descriptive.R`. `Plasma_Biocrates_Complete_Analysis.Rmd` contains the analysis for plasma metabolomics and loads in `Plasma_Biocrates_DataFormattingAndChecker.R` and `Plasma_Biocrates_Descriptive.R`. 
