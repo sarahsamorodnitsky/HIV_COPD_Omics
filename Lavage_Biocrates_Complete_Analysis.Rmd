@@ -1,0 +1,405 @@
+---
+title: "Lavage Biocrates Analysis"
+author: "Sarah Samorodnitsky"
+date: "2/17/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Setting up parameters for the RMarkdown document
+# (from Adam's RMarkdown template)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(fig.width = 12, 
+                      fig.height = 12,
+                      fig.align = 'center')
+options(width = 1000)
+options(scipen=999)
+options(digits=4)
+options(knitr.table.format = "html")
+
+# R packages necessary
+library(kableExtra)
+library(xtable)
+library(tidyverse)
+library(readxl)
+
+
+# Setting up parameters for the analysis
+currentwd <- "/Users/sarahsamorodnitsky/Dropbox/HIV-COPD/Lavage_Biocrates/"
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Reading in the Lavage Biocrates Data and Cleaning {.panel-title}
+## {.panel-body}
+
+### Description of Cleaning Process
+
+Here I will describe the data cleaning procedure I followed. When I received the data, it contained 409 metabolites and 52 subjects. There were 54 subjects in the patient-level data. I started by selecting just the samples that correspond to human measurements by looking for the columns that had "Sample" in the "Sample Type" column. 
+
+I removed a couple IDs that were missing between the lavage metabolite data and the patient-level data. These IDs were V_8 and P_52260024. This left 52 subjects in total and 26 matched case-control pairs. Then, I reordered the lavage metabolite samples to match the order the patient data was given in. The IDs removed belonged to a single case-control pair (they were matched) so I didn't have to rmeove any other subjects because I removed a subject from a case-control pair. 
+
+After this, I checked that the data was not changed after my processing (changing to numeric and reordering). 
+
+Then, I checked how many metabolites were missing measurements on over 50% of subjects. I found that AC(3:0), AC(3:0-OH), AC(3:1), AC(4:0), and AC(4:1) were all missing over 50% of the measurements. I removed these metabolites from the data. This left 404 metabolites remaining. 
+
+Then, I checked how many metabolites had over 50% measurements < LOD. All the lavage samples were run on the same plate, but each metabolite was run using a different operating method. There were four operating methods in total. For each operating method there was a corresponding LOD. Since each subject's metabolite level was only run on one operating method, I simply summed across the columns because the other LODs were set to 0. I found that 151 metabolites had over 50% of their measurements below their corresponding LOD. After removing these metabolites, this left 253 metabolites in the final processed data. 
+
+Now, in the processed data there were still 34 NA values that needed to be dealt with. Based on Adam's explanation, I replaced these values with 0s. 
+
+```{r, eval = FALSE, include = FALSE}
+source(paste0(currentwd, "Lavage_Biocrates_DataFormattingAndChecker.R"))
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Post-Transformation & Filtering Exploratory Analysis {.panel-title}
+## {.panel-body}
+
+```{r, include = FALSE, echo = FALSE}
+source(paste0(currentwd, "Lavage_Biocrates_Descriptive.R"))
+```
+
+Here we show the demographics table for the lavage analysis that summarizes the numbers of patients within cases and controls who have each characteristic. 
+
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+# Making the table
+table1(~ Sex + Age + Ethnicity + Smoker + ART + `FEV1 Percent Predicted`| ccstat, 
+       data = subject_processed_v2,
+       overall = "Total")
+```
+
+After filtering the metabolites, we centered and scaled each metabolite to each mean 0 and standard deviation 1. We also applied a $log(1+x)$ transformation to the metabolites and scaled and centered that data. We display histograms of these two version of the data here to assess normality. 
+
+```{r, echo = FALSE}
+# Making histograms of the scaled and centered data and the log-transformed version
+par(mfrow=c(1,2))
+hist(lavage_scaled, xlab = "Metabolite Transformed Value", main = "Lavage Metabolites Scaled and Centered")
+hist(lavage_log_scaled, xlab = "Metabolite Transformed Value", main = "Lavage Metabolites log(1+x), Scaled and Centered")
+par(mfrow=c(1,1))
+```
+
+We created PCA plots using the scaled and logged data to assess if there are any outliers among the cases and controls and among the treatment groups. Because there are so few observations,  we are hesistant to identify and remove any outliers. 
+
+```{r, echo = FALSE}
+# Making PCA plots
+case_control_colors <- as.factor(subject_processed$ccstat)
+treatment_colors <- as.factor(subject_processed$art)
+
+# Computing the left principal components
+UD <- lavage_svd$u %*% diag(lavage_svd$d, nrow = length(lavage_svd$d))
+
+# Making the plot for case-control status
+par(mfrow = c(1,2))
+plot(UD[,1], UD[,2], xlab = "Principal Component 1", 
+     ylab = "Principal Component 2", 
+     main = "Log-Standardized PC Plot, \n Labeled by Case-Control Status", 
+     col = case_control_colors,
+     pch = 16)
+
+plot(UD[,1], UD[,2], xlab = "Principal Component 1", 
+     ylab = "Principal Component 2", 
+     main = "Log-Standardized PC Plot, \n Labeled by Treatment Status", 
+     col = treatment_colors,
+     pch = 16)
+par(mfrow = c(1,1))
+```
+
+Here is a heatmap of the abundances of metabolites in lavage, ordered by their effect sizes from DWD.
+```{r, echo = FALSE}
+# ordering the loadings from DWD
+w.ordered <- sort(full_training_res$w)
+names(w.ordered) <- lavage_processed$Metabolite
+
+# reordering the metabolites to match the effect sizes
+lavage_log_scaled_info <- lavage_log_scaled
+rownames(lavage_log_scaled_info) <- lavage_processed$Metabolite
+lavage_log_scaled_info_sorted <- lavage_log_scaled_info[match(names(w.ordered),
+                                                              rownames(lavage_log_scaled_info)), ]
+
+# creating a heatmap with the abundances
+heatmap(lavage_log_scaled_info_sorted, Colv = NA, Rowv = NA, labCol = NA, cexRow = 0.75)
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Univariate Testing {.panel-title}
+## {.panel-body}
+
+In this section, we investigate the differences in metabolite levels between cases and controls. Cases and controls were matched based on current smoking status, current treatment status, and age +/- 15 years. To start, we assessed the differences between cases and controls using paired t-tests across each metabolite. For 252 metabolites, we had to perform 252 t-tests, which naturally leads to concerns about type I errors. To minimize the proportion of metabolites deemed significant which are actually null, we followed our testing with a false-discovery rate (FDR) correction. A false discovery rate correction controls the proportion of features (in our case, metabolites) labeled significant that are in reality null features (metabolites that aren't different between cases and controls). 
+
+There were 25 significant metabolites before the FDR adjustment. To perform the FDR adjustment, we order the p-values and pick an FDR threshold $q^*$. After ordering the p-values, $P_{(1)} \leq P_{(2)} \leq \dots \leq P_{(252)}$ we find the largest $k$ such that $P_{(i)} \leq \frac{i}{252} q^*$. Then, we would check the null hypotheses for the $k$ metabolites corresponding to $P_{(1)}, \dots, P_{(k)}$ (Benjamini & Hochberg, 1995). 
+
+None of the metabolites showed significant differences between cases and controls after controlling the FDR at the 5% threshold. However, several did show significance even after the FDR adjustment at the 10% and 20% threshold. By observing the t-test statistics, we can see, between cases and controls, which has a higher level of metabolite. Since the test statistics are negative, it appears the controls have a higher concentration of each metabolite. The metabolites that met the false-discovery rate threshold for significance were all of the same class, namely Glycerophospholipids. 
+
+
+```{r, echo = FALSE, fig.width = 5, fig.height = 8}
+# Performing paired t-tests. Plotting a histogram of the p-values. Adding a false-discovery rate adjustment.
+
+# Making a histogram of the p-values resulting from the paired t-tests. 
+hist(case_control_t.test_res$p.value, xlab = "P-Values",
+     main = "P-Values from Paired T-Tests Across Lavage Metabolites", breaks = 25)
+
+# Creating a table with the FDR-adjusted p-values for each metabolite
+fdr_adjusted_qvalues_l0.05 <- case_control_t.test_fdr_adjust[case_control_t.test_fdr_adjust <= 0.05]
+
+fdr_adjusted_qvalues_l0.1 <- case_control_t.test_fdr_adjust[case_control_t.test_fdr_adjust <= 0.1]
+
+fdr_adjusted_qvalues_l0.2 <- case_control_t.test_fdr_adjust[case_control_t.test_fdr_adjust <= 0.2]
+
+# Displaying the table for 0.1 threshold
+# Table to display
+cc_adjusted_pvalues_0.1 <- data.frame(
+  metabolite = character(length(fdr_adjusted_qvalues_l0.1)),
+  test.stat = numeric(length(fdr_adjusted_qvalues_l0.1)),
+  q.value = numeric(length(fdr_adjusted_qvalues_l0.1)),
+  p.value = numeric(length(fdr_adjusted_qvalues_l0.1)))
+
+# Filling in the table
+cc_adjusted_pvalues_0.1$metabolite <- names(fdr_adjusted_qvalues_l0.1)
+cc_adjusted_pvalues_0.1$test.stat <- case_control_t.test_res$test.stat[case_control_t.test_fdr_adjust <= 0.1]
+cc_adjusted_pvalues_0.1$q.value <- fdr_adjusted_qvalues_l0.1
+cc_adjusted_pvalues_0.1$p.value <- p.values[names(p.values) %in% names(fdr_adjusted_qvalues_l0.1)]
+
+kable(cc_adjusted_pvalues_0.1, format = "html", align = 'c',
+      col.names = c("Metabolite", "t-Test Statistic", "Q-Value", "P-Value"),
+      caption = "Metabolites that were significant with a 10% false-discovery rate multiplicity adjustment") %>% kable_styling(full_width = F)
+
+# Displaying the table for 0.2 threshold
+# Table to display
+cc_adjusted_pvalues_0.2 <- data.frame(
+  metabolite = character(length(fdr_adjusted_qvalues_l0.2)),
+  test.stat = numeric(length(fdr_adjusted_qvalues_l0.2)),
+  q.value = numeric(length(fdr_adjusted_qvalues_l0.2)),
+  p.value = numeric(length(fdr_adjusted_qvalues_l0.2)))
+
+# Filling in the table
+cc_adjusted_pvalues_0.2$metabolite <- names(fdr_adjusted_qvalues_l0.2)
+cc_adjusted_pvalues_0.2$test.stat <- case_control_t.test_res$test.stat[case_control_t.test_fdr_adjust <= 0.2]
+cc_adjusted_pvalues_0.2$q.value <- fdr_adjusted_qvalues_l0.2
+cc_adjusted_pvalues_0.2$p.value <- p.values[names(p.values) %in% names(fdr_adjusted_qvalues_l0.2)]
+
+kable(cc_adjusted_pvalues_0.2, format = "html", align = 'c',
+      col.names = c("Metabolite", "t-Test Statistic", "Q-Value", "P-Value"),
+      caption = "Metabolites that were significant with a 20% false-discovery rate multiplicity adjustment") %>% kable_styling(full_width = F)
+```
+
+Now that we have a set of metabolites that are significant at the 10% and 20% thresholds, we created heatmaps that summarize the comparative abundances of each of the significant proteins. The rows of the heatmap are ordered from the highest effect size of the metabolite in the DWD model fit on the full training dataset to the lowest effect size of the metabolite. 
+```{r, echo = FALSE,, fig.height = 5, fig.width = 5}
+# metabolites significant at the 10% level
+lavage_log_scaled_info <- lavage_log_scaled
+rownames(lavage_log_scaled_info) <- lavage_processed$Metabolite
+
+lavage_metabs_0.1 <- lavage_log_scaled_info[rownames(lavage_log_scaled_info) %in%
+                                              cc_adjusted_pvalues_0.1$metabolite,]
+
+# sorting the rows based on the weights from the DWD model fit on the full training dataset
+metabs_0.1 <- rownames(lavage_metabs_0.1)
+names(full_training_res$w) <- lavage_processed$Metabolite
+full_training_res_0.1 <- full_training_res$w[names(full_training_res$w) %in% metabs_0.1] 
+full_training_res_0.1 <- full_training_res_0.1 %>% abs %>% sort
+lavage_metabs_0.1 <- lavage_metabs_0.1[match(names(full_training_res_0.1), rownames(lavage_metabs_0.1)), ]
+
+# For just the metabolites significant at the 10% level
+heatmap(lavage_metabs_0.1, Colv = NA, Rowv = NA, labCol = NA, cexRow = 0.75)
+
+# For metabolites significant at the 20% level
+lavage_metabs_0.2 <- lavage_log_scaled_info[rownames(lavage_log_scaled_info) %in% cc_adjusted_pvalues_0.2$metabolite,]
+
+# sorting the rows based on the weights from the DWD model fit on the full training dataset
+metabs_0.2 <- rownames(lavage_metabs_0.2)
+full_training_res_0.2 <- full_training_res$w[names(full_training_res$w) %in% metabs_0.2] 
+full_training_res_0.2 <- full_training_res_0.2 %>% abs %>% sort
+lavage_metabs_0.2 <- lavage_metabs_0.2[match(names(full_training_res_0.2), 
+                                             rownames(lavage_metabs_0.2)), ]
+
+heatmap(lavage_metabs_0.2, Colv = NA, Rowv = NA, labCol = NA, cexRow = 0.75)
+```
+
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Distance-Weighted Discrimination {.panel-title}
+## {.panel-body}
+
+The univariate testing approach assesses whether individual metabolites differ between cases and controls. However, if we'd like to assess whether the entire set of metabolite data differs between cases and controls, we can use distance weighted discrimination (DWD). DWD finds linear combinations of features that distinguishes two classes and uses these linear combinations to classify subjects into one of two groups (either case or control). DWD is an appropriate method to use when there are more features than samples (p >> n). The DWD classifier is fit on training data and then applied to test data. When applied to test data, a score is computed for each subject that categorizes them into one of the two groups. 
+
+In our data, the subjects were matched into case-control pairs and we wanted to be cognizant of this matching structure in the DWD. We opted to use a leave-a-pair-out cross validation procedure where we fit the DWD classifier on p-1 pairs (where p = number of matched pairs) and tested it on the held out pair. Under this cross validation approach, we observed a one-tailed p-value from a paired t-test of 0.007 when comparing scores for cases and controls. 
+
+We further elected to use a permutation testing approach, where for 500 iterations, we randomly scrambled within each case-control pair which subject was the case and which subject was the control. Then, we ran our leave-a-pair-out cross validated DWD. For each scrambling, we computed a paired t-test to compare the scores within each matched pair and stored the t-statistic. The alternative hypothesis for this paired t-test is that the score for cases is higher than for controls. 
+
+Our permutation testing approach works like this: within each pair, we randomly choose a subject to be the case and the other to be the control, independent of their metabolite expression levels. By doing this, we know that each subject's case-control status has no relationship with their measured metabolite levels. After randomly picking which subjects are cases and which are controls, we attempt to classify each subject as a case or a control using their metabolite levels and we used a t-test to see how well we did. Naturally, since the case-control labels are assigned randomly, the classifier will not work well and the t-test will show non-significance. Since we repeated this process many times (for many replications, we randomly assigned subjects case-control status and attempted to classify them based on their metabolite levels), we expect sometimes, just by chance, we will be able to classify subjects correctly even though their metabolite levels have no relationship to their case-control status by design. Then, we use the original data (with the correct case-control labels) and we attempt to classify subjects based on their metabolite data. If these metabolites are differentially expressed in cases and controls, then our classifier would correctly predict case status and our t-test would show significance. In other words, the test statistic from the t-test done on the original data should look extreme relative to the test statistics generated from using the data where subjects are randomly assigned to be a case or a control. 
+
+
+Here we show a histogram of the t-statistics from this permutation-based approach. We also display a line where the test statistic computed under the original data (the data with the original case-control labels) falls. This is the bold red line on the histogram. What we'd like to see is that the test statistic on the original data is extreme relative to the other permuted test statistics. We can quantify how extreme the original test statistic is relative to the permutation test statistics by computing a permutation-testing p-value. This p-value is computed as $\frac{\text{Number of Permutation Test Statistics Above Original} +1}{\text{Total Number of Permutations} + 1}$. It was computed here to be 0.0140. This p-value is below a significance level of 0.05 so we can conclude the metabolites collectively offer some predictive power to differentiate between cases and controls. 
+
+```{r, echo = FALSE, fig.height=7, fig.width = 5}
+# -----------------------------------------------------------------------------
+# Distance weighted discrimination to classify cases and controls. 
+# Presenting the results from a permutation-based approach to comparing
+# cases and controls. 
+# -----------------------------------------------------------------------------
+
+# Loading in the package for the density plot
+# library(lattice)
+
+# Renaming the labels to cases and controls from -1 and 1
+# case_control_labels_char <- ifelse(case_control_labels == 1, "case", "control")
+# densityplot(~cv.scores, group = case_control_labels_char, auto.key = TRUE,
+#             xlab = "Cross-Validated DWD Scores",
+#             main = "Cross-Validated DWD Scores \n Between Cases/Controls")
+
+# Loading in the results on the original data (before doing the permutation test)
+# In these results, we leave out a single pair each time, not a single individual. 
+load(paste0(currentwd, "DWD_On_Original_Data_Results.rda"))
+
+# Performing a paired t-test on the cross-validated scores for the original data
+original_data_results <- results_to_save$t.test.res
+
+# Loading in the results from the permutation test based DWD. 
+load(paste0(currentwd, "Permutation_Testing_DWD_Test_Stats.rda"))
+
+# Creating a histogram of the permutation test statistics:
+hist(DWD_t.stats_permute, breaks = 20, 
+     main = "Lavage Permutation Test Statistics After \n Cross-Validated DWD", 
+     xlab = "T-Test Statistics")
+abline(v = original_data_results$statistic, col = 2, lwd = 3)
+
+# Computing the p-value
+p.value.permutation.DWD <- (sum(DWD_t.stats_permute >= original_data_results$statistic) + 1)/(length(DWD_t.stats_permute)+1)
+```
+
+We can also visualize the performance of the DWD classifier using a kernel density estimation plot. The KDE plot shows the distribution of predicted scores for cases and controls as computed by the DWD algorithm. If the predicted scores are largely positive for cases and largely negative for controls, we would know DWD is able to correctly distinguish the two groups. In other words, if the two distributions look divergent, then we can conclude the features in the analysis are predictive of case status. 
+
+In this case, we see modest separation between the two classes. Controls are correctly centered around -1, which is the correct label. Cases are centered around 0, while the correct label was 1. This reflects more uncertainty in the metabolites to correctly classify cases, but more confidence in correctly classifying controls. 
+
+```{r, echo = FALSE}
+# -----------------------------------------------------------------------------
+# Making the KDE plot for the DWD scores to see if the cases and controls 
+# look distinguishable. 
+# -----------------------------------------------------------------------------
+
+library(lattice)
+
+case_control_labels_character <- ifelse(case_control_labels == 1, "Case", "Control")
+
+densityplot(~unlist(results_to_save$cv.scores), group = case_control_labels_character,
+            xlab = "DWD Scores", auto.key = TRUE, 
+            main = "Densities of Predicted Case-Control Groupings \n Based on Lavage DWD Analysis")
+
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Metabolite Familywise Paired T-Tests {.panel-title}
+## {.panel-body}
+
+To get sense of whether certain metabolite families tend to have higher levels of expression among cases or controls, we summed across metabolite families for each subject and compared cases and controls based on these cumulative levels. This test was done using a paired t-test, again, to account for the matching between cases and controls. The following table contains the p-values for these paired tests. All metabolite families were non-significant based on these analyses. This may suggest each metabolite family alone is not predictive, but combined with the results from the DWD analysis, may suggest combined evidence across families in distinguishing cases and controls. However, the power in doing so seems modest at best. 
+
+```{r, echo = FALSE}
+# -----------------------------------------------------------------------------
+# Displaying the results for pairwise t-tests on the cumulative sum of levels
+# for each metabolite family. 
+# -----------------------------------------------------------------------------
+
+kable(metabolite_casecontrol_cumulative, format = "html", align = 'c',
+      col.names = c("Metabolite Family", "Test Statistic", "P-Value"),
+      caption = "Pairwise t-tests comparing cumulative metabolite levels between cases and controls for each family of metabolites.") %>% kable_styling(full_width = F)
+
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Considering FEV1 Percent Predicted {.panel-title}
+## {.panel-body}
+
+We consider FEV1 percent predicted (FEV1pp) as a possible outcome for our metabolite analysis. We start by considering the correlation between FEV1pp and each metabolite in the Biocrates dataset. Considering the significance of the correlations between each metabolite and FEV1pp, we found 5 metabolites to be significant at an FDR threshold of 0.05, 10 at a threshold of 0.1, and 12 at a threshold of 0.2. 
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+# -----------------------------------------------------------------------------
+# Displaying correlation test results for the correlation between FEV1pp
+# and each metabolite 
+# -----------------------------------------------------------------------------
+
+# Creating the table to be a scroll box
+correlation_fev1pp_table <- kable(corr_fev1pp_metabolites, format = "html", align = 'c',
+      caption = "Correlation between metabolites and FEV1 percent predicted. P-values were adjusted for multiple testing using an FDR correction.") %>% kable_styling(full_width = F)
+
+scroll_box(correlation_fev1pp_table, height = "500px")
+```
+
+We then consider a regression model with a LASSO penalty for FEV1pp with all metabolites as predictors. We first applied the model to the entire training dataset and found 10 metabolites to have non-zero coefficients. 
+
+```{r, echo = FALSE, message = FALSE}
+non_zero_betas_tab <- data.frame(Metabolites = names(non_zero_betas),
+                                 Coefficients = non_zero_betas)
+rownames(non_zero_betas_tab) <- NULL
+
+non_zero_betas_tab %>% kable(format = "html", align = 'c',
+      caption = "Metabolites with non-zero coefficients after lasso regression on the full training dataset.") %>% kable_styling(full_width = F)
+```
+
+We then applied the lasso regression model with leave-a-pair-out cross validation. We trained the model using 10-fold cross validation on the training data and then predicted the outcome of the held-out pair. We considered the average weight of each metabolite across the cross validation iterations and display the top weights below. There were 9 metabolites that had non-zero coefficients for over 50% of the cross validation folds. 
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+# Calculating the correlation between the test outcome and the true outcome
+cor(cv.lasso.list, outcome)
+
+# Displaying the average weights of each metabolite across the cross validation iterations
+cv.beta.tab <- data.frame(Metabolite = numeric(dim(lavage_log_scaled)[1]),
+                          Average.Beta = numeric(dim(lavage_log_scaled)[1]),
+                          Prop.Selected = numeric(dim(lavage_log_scaled)[1]))
+cv.beta.tab$Metabolite <- names(cv.average.beta)
+cv.beta.tab$Average.Beta <- cv.average.beta
+cv.beta.tab$Prop.Selected <- cv.prop.nonzero
+cv.beta.tab.reorder <- cv.beta.tab[order(abs(cv.beta.tab$Prop.Selected), decreasing = TRUE),]
+
+cv.beta.tab.reorder[cv.beta.tab.reorder$Prop.Selected > 0.5,] %>% kable(format = "html", align = 'c',
+      caption = "Average coefficients of metabolites after lasso regression on the with cross validation. Coefficients were averaged across the cross validation iterations. Metabolites shown are those that were selected over 50% of the cross validation folds.") %>% kable_styling(full_width = F) %>% 
+  scroll_box(height = "500px")
+
+# Plotting the predicted outcome against the true outcome
+plot(outcome, cv.lasso.list, xlab = "True Outcome", ylab = "Predicted Outcome",
+     main = "FEV1pp Observed vs. Predicted Outcome from Lasso Regression", pch = 16)
+abline(a = 0, b = 1)
+```
+
+We then consider leave-a-pair-out cross validation where we hold out a case:control pair, fit the lasso model with cross validation on the training dataset, then predict the outcome for the held-out pair using the training model coefficients. To assess the accuracy of the model, we compute the correlation between the predicted outcomes and the true outcomes. We found the correlation between the two to be 0.42, indicating modest correlation between the predicted outcome and the observed outcome. 
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Correlation with DLCO {.panel-title}
+## {.panel-body}
+
+In this section, we test the correlation between each metabolite and DLCO. DLCO is a measure of lung function where lower values indicate more severe lung disease and higher values suggest normal lung function. Lower values of DLCO are typically associated with emphysema. DLCO values were only available for the Pittsburgh cohort, so we subset the Biocrates data to include just the Pittsburgh individuals. One patient was not available in the Biocrates dataset, P_52260024, who was present in the Pittsburgh clinical data and the overall clinical data. I removed this subject while cleaning the data earlier because their information had not been present in the original Biocrates data provided. This left 31 subjects in the lavage Biocrates data to test for association with DLCO.
+
+No metabolites were significantly correlation with DLCO after FDR adjustment. Even prior to FDR adjustment, the p-values were not very low. This may be due to the small sample size (31) relative to the number of metabolites (252) testing against. 
+
+```{r Table of Correlations with DLCO, echo = FALSE, message = FALSE, warning = FALSE}
+# Display table
+kable(dlco_corr, format = "html", align = "c",
+      col.names = c("Metabolite", "Test Stat", "P-Value", "Q-Value"),
+      caption = "Correlation between metabolites and DLCO. ") %>% 
+  kable_styling(full_width = F) %>% scroll_box(height= "500px")
+```
+When we looked specifically at the metabolites that were significant in paired t-testing and correlation with FEV1pp, as well as those metabolites with non-zero coefficients in lasso regression for FEV1pp, we found that none were significant before or after FDR adjustment. 
+
+
+```{r Table of Correlations with DLCO (Just Significant Metabolites), echo = FALSE, message = FALSE, warning = FALSE}
+# Display table
+kable(dlco_corr_for_metabolites, format = "html", align = "c",
+      col.names = c("Metabolite", "Test Stat", "P-Value", "Q-Value"),
+      caption = "Correlation between metabolites and DLCO. ") %>% 
+  kable_styling(full_width = F) 
+```
+
+# {.panel .panel-success}
+## {.panel-heading}
+### Preliminary Conclusions {.panel-title}
+## {.panel-body}
+
+Our analysis suggests metabolite levels in lung fluid, when taken collectively are able to modestly differentiate between cases and controls. This was demonstrated by our DWD approach. We were able to zero in on a few metabolites, each of which belonged to the Glycerophospholipids family, that seemed to have significantly lower representation in cases than controls after correcting for false positives. However, we used a 10% and 20% threshold to check this, which is higher than we might have liked. Despite this, no metabolite family stood out as being overrepresented among cases or controls after adding up expression levels within each family for each subject.  
